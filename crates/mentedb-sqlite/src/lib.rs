@@ -21,12 +21,13 @@
 //! gone. This is the substrate the facade will eventually talk to instead of
 //! `StorageEngine` + `IndexManager` + `GraphManager`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use mentedb_core::edge::EdgeType;
+use mentedb_core::error::MenteResult;
 use mentedb_core::memory::MemoryType;
-use mentedb_core::types::{MemoryId, SpaceId, AgentId};
+use mentedb_core::types::{AgentId, MemoryId, SpaceId, Timestamp};
 use mentedb_core::{MemoryEdge, MemoryNode, MenteError};
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -82,6 +83,12 @@ fn normalize(v: &[f32]) -> Vec<f32> {
         return v.to_vec();
     }
     v.iter().map(|x| x / norm).collect()
+}
+
+/// Dot product of two equal-length slices. For unit vectors this is cosine
+/// similarity, which is how [`Backend::vector_search_filtered`] ranks.
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
 /// Convert L2 squared-distance on unit vectors into cosine similarity in
@@ -269,9 +276,32 @@ impl Backend {
             );
             CREATE INDEX IF NOT EXISTS idx_edge_source ON edges(source, edge_type);
             CREATE INDEX IF NOT EXISTS idx_edge_target ON edges(target, edge_type);
+
+            -- Full-text mirror of `memories.content` (replaces Bm25Index).
+            -- External-content FTS5 keyed by the implicit `memories.rowid`;
+            -- the triggers keep it in sync with upserts/deletes on `memories`.
+            CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+                content,
+                content='memories',
+                content_rowid='rowid'
+            );
+            CREATE TRIGGER IF NOT EXISTS memories_fts_ai AFTER INSERT ON memories BEGIN
+                INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
+            END;
+            CREATE TRIGGER IF NOT EXISTS memories_fts_ad AFTER DELETE ON memories BEGIN
+                INSERT INTO memories_fts(memories_fts, rowid, content) VALUES('delete', old.rowid, old.content);
+            END;
+            CREATE TRIGGER IF NOT EXISTS memories_fts_au AFTER UPDATE ON memories BEGIN
+                INSERT INTO memories_fts(memories_fts, rowid, content) VALUES('delete', old.rowid, old.content);
+                INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
+            END;
             "#,
         )
         .map_err(store_err)?;
+
+        // Populate FTS from any pre-existing rows (no-op on a fresh open).
+        // FTS5's 'rebuild' command rescans the external content table.
+        let _ = tx.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')", []);
 
         // The vec0 dimension is fixed at table-creation time. We record the dim
         // in schema_meta so a later open with a different embedder can detect
@@ -747,6 +777,296 @@ impl Backend {
         }
         Ok(())
     }
+
+    // -----------------------------------------------------------------------
+    // Hybrid search — replaces IndexManager (RRF over vec0 + FTS5 BM25).
+    // -----------------------------------------------------------------------
+
+    /// Vector + optional BM25 hybrid search (no tag filter). Mirrors
+    /// `IndexManager::hybrid_search`.
+    pub fn hybrid_search(
+        &self,
+        query_embedding: &[f32],
+        tags: Option<&[&str]>,
+        time_range: Option<(Timestamp, Timestamp)>,
+        k: usize,
+    ) -> MenteResult<Vec<(MemoryId, f32)>> {
+        self.hybrid_search_with_query_mode(query_embedding, None, tags, false, time_range, k)
+    }
+
+    /// Hybrid search with an optional text query for BM25 matching.
+    pub fn hybrid_search_with_query(
+        &self,
+        query_embedding: &[f32],
+        query_text: Option<&str>,
+        tags: Option<&[&str]>,
+        time_range: Option<(Timestamp, Timestamp)>,
+        k: usize,
+    ) -> MenteResult<Vec<(MemoryId, f32)>> {
+        self.hybrid_search_with_query_mode(query_embedding, query_text, tags, false, time_range, k)
+    }
+
+    /// Hybrid search with configurable tag mode (AND vs OR). Mirrors
+    /// `IndexManager::hybrid_search_with_query_mode`.
+    ///
+    /// Algorithm (faithful port of the IndexManager fusion): take the top
+    /// `k*4` vector candidates (vec0 KNN, or brute-force cosine over the
+    /// filter candidate set when tag/time filters are present), take the top
+    /// `k*4` BM25 candidates from FTS5, merge via Reciprocal Rank Fusion
+    /// (rrf_k = 60), drop anything outside the candidate set, then boost by
+    /// salience (×0.05) and a fixed recency term (×0.02 × 0.5) before
+    /// truncating to `k`.
+    pub fn hybrid_search_with_query_mode(
+        &self,
+        query_embedding: &[f32],
+        query_text: Option<&str>,
+        tags: Option<&[&str]>,
+        tags_or: bool,
+        time_range: Option<(Timestamp, Timestamp)>,
+        k: usize,
+    ) -> MenteResult<Vec<(MemoryId, f32)>> {
+        if k == 0 || query_embedding.is_empty() {
+            return Ok(Vec::new());
+        }
+        let fetch_k = k * 4;
+        let rrf_k: f32 = 60.0;
+
+        // 1) Candidate filter set from tags + time window.
+        let candidate_set = self.candidate_set(tags, tags_or, time_range)?;
+        // Filters requested but nothing matches → no results.
+        if matches!(candidate_set.as_ref().map(|s| s.len()), Some(0)) {
+            return Ok(Vec::new());
+        }
+
+        // 2) Vector candidates: brute-force over the candidate set when filters
+        //    are present (so restrictive filters still return k results),
+        //    otherwise a plain vec0 KNN.
+        let vector_hits: Vec<MemoryId> = match &candidate_set {
+            Some(cs) => self.vector_search_filtered(query_embedding, cs, fetch_k)?,
+            None => self
+                .knn(query_embedding, fetch_k)?
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect(),
+        };
+
+        // 3) BM25 candidates from FTS5 (when a text query is provided).
+        let bm25_hits: Vec<MemoryId> = match query_text {
+            Some(qt) if !qt.is_empty() => self.fts_search(qt, fetch_k)?,
+            _ => Vec::new(),
+        };
+
+        if vector_hits.is_empty() && bm25_hits.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // 4) Reciprocal Rank Fusion.
+        let mut rrf: HashMap<MemoryId, f32> = HashMap::new();
+        for (rank, id) in vector_hits.iter().enumerate() {
+            *rrf.entry(*id).or_insert(0.0) += 1.0 / (rrf_k + rank as f32);
+        }
+        for (rank, id) in bm25_hits.iter().enumerate() {
+            *rrf.entry(*id).or_insert(0.0) += 1.0 / (rrf_k + rank as f32);
+        }
+
+        // 5) Apply the candidate filter (drops bm25 hits that fall outside it)
+        //    and add the salience + recency boost.
+        let mut scored: Vec<(MemoryId, f32)> = Vec::with_capacity(rrf.len());
+        for (id, rrf_score) in rrf {
+            if let Some(cs) = &candidate_set {
+                if !cs.contains(&id) {
+                    continue;
+                }
+            }
+            let salience = self.salience_of(id)?.unwrap_or(0.5);
+            let recency = 0.5f32;
+            let combined = rrf_score * 0.7 + salience * 0.05 + recency * 0.02;
+            scored.push((id, combined));
+        }
+
+        // 6) Rank and truncate.
+        scored.sort_unstable_by(|a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        scored.truncate(k);
+        Ok(scored)
+    }
+
+    // --- hybrid search helpers ---------------------------------------------
+
+    /// Build the candidate id set imposed by tag + time filters. Returns
+    /// `None` when no filters were requested, `Some(empty)` when filters were
+    /// requested but matched nothing.
+    fn candidate_set(
+        &self,
+        tags: Option<&[&str]>,
+        tags_or: bool,
+        time_range: Option<(Timestamp, Timestamp)>,
+    ) -> MenteResult<Option<HashSet<MemoryId>>> {
+        match (tags, time_range) {
+            (None, None) => Ok(None),
+            (Some(t), None) => Ok(Some(self.ids_matching_tags(t, tags_or)?)),
+            (None, Some((start, end))) => Ok(Some(self.ids_matching_time(start, end)?)),
+            (Some(t), Some((start, end))) => {
+                let tag_set = self.ids_matching_tags(t, tags_or)?;
+                let time_set = self.ids_matching_time(start, end)?;
+                Ok(Some(tag_set.intersection(&time_set).copied().collect()))
+            }
+        }
+    }
+
+    /// Memory ids carrying the requested tags. `or = true` → union (any tag),
+    /// `or = false` → intersection (all tags).
+    fn ids_matching_tags(&self, tags: &[&str], or: bool) -> MenteResult<HashSet<MemoryId>> {
+        if tags.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let conn = self.conn.lock();
+        let placeholders = tags.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = if or {
+            format!(
+                "SELECT DISTINCT memory_id FROM memory_tags WHERE tag IN ({placeholders})"
+            )
+        } else {
+            format!(
+                "SELECT memory_id FROM memory_tags WHERE tag IN ({placeholders})
+                 GROUP BY memory_id HAVING COUNT(DISTINCT tag) = ?"
+            )
+        };
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = tags
+            .iter()
+            .map(|t| Box::new((*t).to_string()) as Box<dyn rusqlite::ToSql>)
+            .collect();
+        if !or {
+            params_vec.push(Box::new(tags.len() as i64));
+        }
+        let mut stmt = conn.prepare(&sql).map_err(store_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params_vec.into_iter()), |row| {
+                Ok(parse_id::<MemoryId>(&row.get::<_, String>(0)?)
+                    .unwrap_or_else(|_| MemoryId::nil()))
+            })
+            .map_err(store_err)?;
+        let mut out = HashSet::new();
+        for row in rows {
+            out.insert(row.map_err(store_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Memory ids whose `created_at` falls within `[start, end]` inclusive.
+    fn ids_matching_time(&self, start: Timestamp, end: Timestamp) -> MenteResult<HashSet<MemoryId>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare("SELECT id FROM memories WHERE created_at >= ?1 AND created_at <= ?2")
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![start as i64, end as i64], |row| {
+                Ok(parse_id::<MemoryId>(&row.get::<_, String>(0)?)
+                    .unwrap_or_else(|_| MemoryId::nil()))
+            })
+            .map_err(store_err)?;
+        let mut out = HashSet::new();
+        for row in rows {
+            out.insert(row.map_err(store_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Brute-force cosine ranking over a candidate set, returning the top `k`
+    /// ids most similar to `query`. Used when tag/time filters are present so
+    /// that restrictive filters don't starve the global vec0 KNN.
+    fn vector_search_filtered(
+        &self,
+        query: &[f32],
+        candidates: &HashSet<MemoryId>,
+        k: usize,
+    ) -> MenteResult<Vec<MemoryId>> {
+        if candidates.is_empty() || k == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock();
+        let placeholders = candidates.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT id, embedding FROM memories WHERE embedding IS NOT NULL AND id IN ({placeholders})"
+        );
+        let params_vec: Vec<Box<dyn rusqlite::ToSql>> = candidates
+            .iter()
+            .map(|id| Box::new(id.to_string()) as Box<dyn rusqlite::ToSql>)
+            .collect();
+        let mut stmt = conn.prepare(&sql).map_err(store_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params_vec.into_iter()), |row| {
+                let id = parse_id::<MemoryId>(&row.get::<_, String>(0)?)
+                    .unwrap_or_else(|_| MemoryId::nil());
+                let emb: Vec<u8> = row.get(1)?;
+                Ok((id, blob_to_embedding(&emb)))
+            })
+            .map_err(store_err)?;
+
+        let qnorm = normalize(query);
+        let mut scored: Vec<(MemoryId, f32)> = Vec::new();
+        for row in rows {
+            let (id, emb) = row.map_err(store_err)?;
+            scored.push((id, dot(&qnorm, &normalize(&emb))));
+        }
+        scored.sort_unstable_by(|a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        scored.truncate(k);
+        Ok(scored.into_iter().map(|(id, _)| id).collect())
+    }
+
+    /// FTS5 BM25 search over `memories.content`. Returns ids best-matching the
+    /// query text (most relevant first). A malformed MATCH query yields an
+    /// empty result rather than failing the whole hybrid search.
+    fn fts_search(&self, query_text: &str, k: usize) -> MenteResult<Vec<MemoryId>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT m.id FROM memories_fts f
+                 JOIN memories m ON m.rowid = f.rowid
+                 WHERE memories_fts MATCH ?1
+                 ORDER BY bm25(memories_fts)
+                 LIMIT ?2",
+            )
+            .map_err(store_err)?;
+        let rows_result = stmt.query_map(params![query_text, k as i64], |row| {
+            Ok(parse_id::<MemoryId>(&row.get::<_, String>(0)?)
+                .unwrap_or_else(|_| MemoryId::nil()))
+        });
+        let mut out = Vec::new();
+        match rows_result {
+            Ok(rows) => {
+                for row in rows {
+                    match row {
+                        Ok(id) => out.push(id),
+                        // MATCH syntax error / bad token → treat as no matches.
+                        Err(_) => {
+                            out.clear();
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(_) => return Ok(Vec::new()),
+        }
+        Ok(out)
+    }
+
+    /// Read one memory's salience, or `None` if it does not exist.
+    fn salience_of(&self, id: MemoryId) -> MenteResult<Option<f32>> {
+        let conn = self.conn.lock();
+        let value: Option<f64> = conn
+            .query_row(
+                "SELECT salience FROM memories WHERE id = ?1",
+                params![id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(store_err)?;
+        Ok(value.map(|v| v as f32))
+    }
 }
 
 #[cfg(test)]
@@ -966,5 +1286,98 @@ mod tests {
         assert!(res.is_err());
         // Nothing should have been written.
         assert_eq!(db.count().unwrap(), 0);
+    }
+
+    // --- hybrid search -----------------------------------------------------
+
+    #[test]
+    fn hybrid_vector_only_ranks_nearest_first() {
+        let db = Backend::open_in_memory(2).unwrap();
+        let a = MemoryId::new();
+        let b = MemoryId::new();
+        db.store_memory(&make_node(a, "east text", vec![1.0, 0.0])).unwrap();
+        db.store_memory(&make_node(b, "north text", vec![0.0, 1.0])).unwrap();
+
+        let res = db.hybrid_search(&[0.95, 0.05], None, None, 2).unwrap();
+        assert_eq!(res.len(), 2);
+        assert_eq!(res[0].0, a, "east should rank first");
+    }
+
+    #[test]
+    fn hybrid_with_bm25_finds_by_keyword() {
+        let db = Backend::open_in_memory(2).unwrap();
+        let a = MemoryId::new();
+        let b = MemoryId::new();
+        // `a` is vector-far but keyword-matches "postgres"; `b` is vector-close
+        // but has no matching keyword. RRF must still surface `a`.
+        db.store_memory(&make_node(a, "postgres database migration", vec![0.0, 1.0])).unwrap();
+        db.store_memory(&make_node(b, "unrelated content", vec![1.0, 0.0])).unwrap();
+
+        let res =
+            db.hybrid_search_with_query(&[1.0, 0.0], Some("postgres"), None, None, 2).unwrap();
+        assert!(
+            res.iter().any(|(id, _)| *id == a),
+            "bm25 match should surface a despite low vector similarity"
+        );
+    }
+
+    #[test]
+    fn hybrid_tag_filter_restricts_results() {
+        let db = Backend::open_in_memory(2).unwrap();
+        let a = MemoryId::new();
+        let b = MemoryId::new();
+        let mut na = make_node(a, "alpha", vec![1.0, 0.0]);
+        na.tags = vec!["x".into()];
+        let mut nb = make_node(b, "beta", vec![0.9, 0.1]);
+        nb.tags = vec!["y".into()];
+        db.store_memory(&na).unwrap();
+        db.store_memory(&nb).unwrap();
+
+        let res = db.hybrid_search(&[1.0, 0.0], Some(&["x"]), None, 10).unwrap();
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].0, a);
+    }
+
+    #[test]
+    fn hybrid_tag_and_mode_requires_all_tags() {
+        let db = Backend::open_in_memory(2).unwrap();
+        let a = MemoryId::new();
+        let b = MemoryId::new();
+        let mut na = make_node(a, "both", vec![1.0, 0.0]);
+        na.tags = vec!["x".into(), "y".into()];
+        let mut nb = make_node(b, "one", vec![0.9, 0.1]);
+        nb.tags = vec!["x".into()];
+        db.store_memory(&na).unwrap();
+        db.store_memory(&nb).unwrap();
+
+        // AND mode: only `a` has both x and y.
+        let res =
+            db.hybrid_search_with_query_mode(&[1.0, 0.0], None, Some(&["x", "y"]), false, None, 10)
+                .unwrap();
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].0, a);
+
+        // OR mode: both have at least x.
+        let res_or =
+            db.hybrid_search_with_query_mode(&[1.0, 0.0], None, Some(&["x", "y"]), true, None, 10)
+                .unwrap();
+        assert_eq!(res_or.len(), 2);
+    }
+
+    #[test]
+    fn hybrid_time_filter_restricts_results() {
+        let db = Backend::open_in_memory(2).unwrap();
+        let a = MemoryId::new();
+        let b = MemoryId::new();
+        let mut na = make_node(a, "old", vec![1.0, 0.0]);
+        na.created_at = 100;
+        let mut nb = make_node(b, "new", vec![0.9, 0.1]);
+        nb.created_at = 500;
+        db.store_memory(&na).unwrap();
+        db.store_memory(&nb).unwrap();
+
+        let res = db.hybrid_search(&[1.0, 0.0], None, Some((400, 600)), 10).unwrap();
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].0, b);
     }
 }
