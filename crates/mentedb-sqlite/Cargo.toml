@@ -1,0 +1,22 @@
+[package]
+name = "mentedb-sqlite"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SQLite + sqlite-vec storage backend for MenteDB (replaces the page/WAL/HNSW/CSR engine)"
+
+[dependencies]
+mentedb-core = { workspace = true }
+# `bundled` compiles a recent SQLite so the vec0 + FTS5 virtual tables are
+# available everywhere regardless of the (old) system SQLite on macOS.
+rusqlite = { version = "0.31", features = ["bundled"] }
+sqlite-vec = "0.1"
+bytemuck = { workspace = true }
+serde_json = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
