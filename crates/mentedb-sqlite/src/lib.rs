@@ -21,11 +21,13 @@
 //! gone. This is the substrate the facade will eventually talk to instead of
 //! `StorageEngine` + `IndexManager` + `GraphManager`.
 
+use std::collections::HashSet;
 use std::path::Path;
 
+use mentedb_core::edge::EdgeType;
 use mentedb_core::memory::MemoryType;
 use mentedb_core::types::{MemoryId, SpaceId, AgentId};
-use mentedb_core::{MemoryNode, MenteError};
+use mentedb_core::{MemoryEdge, MemoryNode, MenteError};
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -112,6 +114,44 @@ fn parse_memory_type(s: &str) -> MemoryType {
         "Reasoning" => MemoryType::Reasoning,
         "Correction" => MemoryType::Correction,
         _ => MemoryType::Episodic,
+    }
+}
+
+/// Which side of a memory node to read edges from.
+#[derive(Clone, Copy, Debug)]
+pub enum Direction {
+    /// Edges where the node is the source.
+    Outgoing,
+    /// Edges where the node is the target.
+    Incoming,
+    /// Both directions.
+    Both,
+}
+
+fn edge_type_str(t: EdgeType) -> &'static str {
+    match t {
+        EdgeType::Caused => "Caused",
+        EdgeType::Before => "Before",
+        EdgeType::Related => "Related",
+        EdgeType::Contradicts => "Contradicts",
+        EdgeType::Supports => "Supports",
+        EdgeType::Supersedes => "Supersedes",
+        EdgeType::Derived => "Derived",
+        EdgeType::PartOf => "PartOf",
+    }
+}
+
+fn parse_edge_type(s: &str) -> EdgeType {
+    match s {
+        "Caused" => EdgeType::Caused,
+        "Before" => EdgeType::Before,
+        "Related" => EdgeType::Related,
+        "Contradicts" => EdgeType::Contradicts,
+        "Supports" => EdgeType::Supports,
+        "Supersedes" => EdgeType::Supersedes,
+        "Derived" => EdgeType::Derived,
+        "PartOf" => EdgeType::PartOf,
+        _ => EdgeType::Related,
     }
 }
 
@@ -214,6 +254,21 @@ impl Backend {
                 PRIMARY KEY (memory_id, tag)
             );
             CREATE INDEX IF NOT EXISTS idx_tag ON memory_tags(tag);
+
+            -- Knowledge graph edges (replaces the CSR/CSC graph). Traversal is
+            -- done via the recursive CTE in [`Backend::subgraph`].
+            CREATE TABLE IF NOT EXISTS edges (
+                source     TEXT NOT NULL,
+                target     TEXT NOT NULL,
+                edge_type  TEXT NOT NULL,
+                weight     REAL NOT NULL,
+                created_at INTEGER NOT NULL,
+                valid_from INTEGER,
+                valid_until INTEGER,
+                label      TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_edge_source ON edges(source, edge_type);
+            CREATE INDEX IF NOT EXISTS idx_edge_target ON edges(target, edge_type);
             "#,
         )
         .map_err(store_err)?;
@@ -490,6 +545,208 @@ impl Backend {
         }
         Ok(out)
     }
+
+    // -----------------------------------------------------------------------
+    // Edges (knowledge graph) — replaces the CSR/CSC graph engine.
+    // -----------------------------------------------------------------------
+
+    /// Insert a typed, weighted, optionally temporally-bounded edge between two
+    /// memories. Duplicate edges are permitted (the original CSR did too).
+    pub fn add_edge(&self, edge: &MemoryEdge) -> Result<(), MenteError> {
+        let conn = self.conn.lock();
+        conn.execute(
+            r#"INSERT INTO edges
+                 (source, target, edge_type, weight, created_at, valid_from, valid_until, label)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+            params![
+                edge.source.to_string(),
+                edge.target.to_string(),
+                edge_type_str(edge.edge_type),
+                edge.weight as f64,
+                edge.created_at as i64,
+                edge.valid_from.map(|t| t as i64),
+                edge.valid_until.map(|t| t as i64),
+                edge.label,
+            ],
+        )
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    /// Load every edge touching `id` from the chosen direction(s).
+    pub fn edges_for(&self, id: MemoryId, dir: Direction) -> Result<Vec<MemoryEdge>, MenteError> {
+        let conn = self.conn.lock();
+        let id_str = id.to_string();
+        let sql = match dir {
+            Direction::Outgoing => "SELECT source, target, edge_type, weight, created_at, valid_from, valid_until, label FROM edges WHERE source = ?1",
+            Direction::Incoming => "SELECT source, target, edge_type, weight, created_at, valid_from, valid_until, label FROM edges WHERE target = ?1",
+            Direction::Both => "SELECT source, target, edge_type, weight, created_at, valid_from, valid_until, label FROM edges WHERE source = ?1 OR target = ?1",
+        };
+        let mut stmt = conn.prepare(sql).map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![id_str], |row| {
+                Ok(MemoryEdge {
+                    source: parse_id::<MemoryId>(&row.get::<_, String>(0)?)
+                        .unwrap_or_else(|_| MemoryId::nil()),
+                    target: parse_id::<MemoryId>(&row.get::<_, String>(1)?)
+                        .unwrap_or_else(|_| MemoryId::nil()),
+                    edge_type: parse_edge_type(&row.get::<_, String>(2)?),
+                    weight: row.get::<_, f64>(3)? as f32,
+                    created_at: row.get::<_, i64>(4)? as u64,
+                    valid_from: row.get::<_, Option<i64>>(5)?.map(|t| t as u64),
+                    valid_until: row.get::<_, Option<i64>>(6)?.map(|t| t as u64),
+                    label: row.get::<_, Option<String>>(7)?,
+                })
+            })
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(store_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Distinct neighbor ids of `id` via edges of the given types (None = all
+    /// types) in the chosen direction. Drives belief propagation and
+    /// contradiction traversal.
+    pub fn neighbors(
+        &self,
+        id: MemoryId,
+        edge_types: Option<&[EdgeType]>,
+        dir: Direction,
+    ) -> Result<Vec<MemoryId>, MenteError> {
+        let edges = self.edges_for(id, dir)?;
+        let type_ok = |e: &MemoryEdge| match edge_types {
+            None => true,
+            Some(ts) => ts.contains(&e.edge_type),
+        };
+        let mut out: Vec<MemoryId> = Vec::new();
+        for e in edges.into_iter().filter(|e| type_ok(e)) {
+            let other = if e.source == id { e.target } else { e.source };
+            if !out.contains(&other) {
+                out.push(other);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Traverse outwards from `roots` up to `max_depth` hops following outgoing
+    /// edges of the given types (None = all). Implemented as a SQLite recursive
+    /// CTE so traversal runs entirely inside the database instead of an
+    /// application-side BFS over a CSR. Returns the set of reachable ids
+    /// (including the roots).
+    pub fn subgraph(
+        &self,
+        roots: &[MemoryId],
+        max_depth: usize,
+        edge_types: Option<&[EdgeType]>,
+    ) -> Result<HashSet<MemoryId>, MenteError> {
+        if roots.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let conn = self.conn.lock();
+
+        // Base case: one `SELECT ?, 0` per root, UNION ALL'd together.
+        let base: String = (0..roots.len())
+            .map(|_| "SELECT ?, 0")
+            .collect::<Vec<_>>()
+            .join(" UNION ALL ");
+
+        // Optional edge-type filter on the recursive arm.
+        let type_filter = match edge_types {
+            Some(ts) if !ts.is_empty() => {
+                let ins: String = ts.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                format!(" AND e.edge_type IN ({ins})")
+            }
+            _ => String::new(),
+        };
+
+        let sql = format!(
+            "WITH RECURSIVE reach(id, depth) AS (
+                {base}
+                UNION ALL
+                SELECT e.target, r.depth + 1
+                FROM reach r JOIN edges e ON e.source = r.id
+                WHERE r.depth < ? {type_filter}
+             )
+             SELECT DISTINCT id FROM reach"
+        );
+
+        // Bind parameters in order: roots, depth, then edge-type labels.
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        for r in roots {
+            params_vec.push(Box::new(r.to_string()));
+        }
+        params_vec.push(Box::new(max_depth as i64));
+        if let Some(ts) = edge_types {
+            for t in ts {
+                params_vec.push(Box::new(edge_type_str(*t).to_string()));
+            }
+        }
+
+        let mut stmt = conn.prepare(&sql).map_err(store_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params_vec.into_iter()), |row| {
+                Ok(parse_id::<MemoryId>(&row.get::<_, String>(0)?).unwrap_or_else(|_| MemoryId::nil()))
+            })
+            .map_err(store_err)?;
+        let mut out = HashSet::new();
+        for row in rows {
+            out.insert(row.map_err(store_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Remove every edge that touches `id` (used when forgetting a memory).
+    pub fn delete_edges_for(&self, id: MemoryId) -> Result<(), MenteError> {
+        let conn = self.conn.lock();
+        let s = id.to_string();
+        conn.execute("DELETE FROM edges WHERE source = ?1 OR target = ?1", params![s])
+            .map_err(store_err)?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Bulk helpers — replace StorageEngine::scan_all_memories / store_memory_batch
+    // -----------------------------------------------------------------------
+
+    /// Every stored memory id (used on open instead of rebuilding a page map).
+    pub fn all_memory_ids(&self) -> Result<Vec<MemoryId>, MenteError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare("SELECT id FROM memories").map_err(store_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(parse_id::<MemoryId>(&row.get::<_, String>(0)?).unwrap_or_else(|_| MemoryId::nil()))
+            })
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(store_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Validate and persist many nodes. Dimensions are checked up front so a
+    /// bad row aborts before any write. Each node goes through [`store_memory`]
+    /// (its own implicit transaction); for true single-transaction batching we
+    /// would fold the per-node SQL under one `tx`, but per-item cost is
+    /// dominated by SQLite I/O anyway.
+    ///
+    /// [`store_memory`]: Backend::store_memory
+    pub fn store_memory_batch(&self, nodes: &[MemoryNode]) -> Result<(), MenteError> {
+        for n in nodes {
+            if !n.embedding.is_empty() && n.embedding.len() != self.embedding_dim {
+                return Err(MenteError::EmbeddingDimensionMismatch {
+                    got: n.embedding.len(),
+                    expected: self.embedding_dim,
+                });
+            }
+        }
+        for n in nodes {
+            self.store_memory(n)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -587,5 +844,127 @@ mod tests {
         let db = Backend::open(&path, 2).unwrap();
         let loaded = db.get_memory(id).unwrap().expect("should survive reopen");
         assert_eq!(loaded.content, "persisted");
+    }
+
+    // --- edges + graph traversal ------------------------------------------
+
+    fn edge(src: MemoryId, tgt: MemoryId, et: EdgeType, w: f32) -> MemoryEdge {
+        MemoryEdge {
+            source: src,
+            target: tgt,
+            edge_type: et,
+            weight: w,
+            created_at: 1000,
+            valid_from: None,
+            valid_until: None,
+            label: None,
+        }
+    }
+
+    #[test]
+    fn edges_roundtrip_and_directions() {
+        let db = Backend::open_in_memory(2).unwrap();
+        let a = MemoryId::new();
+        let b = MemoryId::new();
+        let c = MemoryId::new();
+        db.add_edge(&edge(a, b, EdgeType::Related, 0.5)).unwrap();
+        db.add_edge(&edge(c, a, EdgeType::Supports, 0.9)).unwrap();
+
+        let out = db.edges_for(a, Direction::Outgoing).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].target, b);
+
+        let inc = db.edges_for(a, Direction::Incoming).unwrap();
+        assert_eq!(inc.len(), 1);
+        assert_eq!(inc[0].source, c);
+
+        let both = db.edges_for(a, Direction::Both).unwrap();
+        assert_eq!(both.len(), 2);
+    }
+
+    #[test]
+    fn neighbors_filtered_by_edge_type() {
+        let db = Backend::open_in_memory(2).unwrap();
+        let a = MemoryId::new();
+        let b = MemoryId::new();
+        let c = MemoryId::new();
+        db.add_edge(&edge(a, b, EdgeType::Related, 0.5)).unwrap();
+        db.add_edge(&edge(a, c, EdgeType::Contradicts, 0.9)).unwrap();
+
+        let related = db.neighbors(a, Some(&[EdgeType::Related]), Direction::Outgoing).unwrap();
+        assert_eq!(related, vec![b]);
+
+        let contradicts = db.neighbors(a, Some(&[EdgeType::Contradicts]), Direction::Outgoing).unwrap();
+        assert_eq!(contradicts, vec![c]);
+
+        let all = db.neighbors(a, None, Direction::Outgoing).unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn subgraph_traverses_outgoing_edges() {
+        let db = Backend::open_in_memory(2).unwrap();
+        // Chain a -> b -> c, plus a -> d (unrelated type to filter out).
+        let a = MemoryId::new();
+        let b = MemoryId::new();
+        let c = MemoryId::new();
+        let d = MemoryId::new();
+        db.add_edge(&edge(a, b, EdgeType::Caused, 1.0)).unwrap();
+        db.add_edge(&edge(b, c, EdgeType::Caused, 1.0)).unwrap();
+        db.add_edge(&edge(a, d, EdgeType::Related, 0.1)).unwrap();
+
+        // Follow Caused only, from a, depth 5: reaches {a, b, c}, excludes d.
+        let reach = db.subgraph(&[a], 5, Some(&[EdgeType::Caused])).unwrap();
+        assert!(reach.contains(&a));
+        assert!(reach.contains(&b));
+        assert!(reach.contains(&c));
+        assert!(!reach.contains(&d), "Related edge to d must be excluded");
+
+        // Depth cap: depth 0 reaches only the root.
+        let depth0 = db.subgraph(&[a], 0, None).unwrap();
+        assert_eq!(depth0.len(), 1);
+        assert!(depth0.contains(&a));
+    }
+
+    #[test]
+    fn delete_edges_for_removes_both_directions() {
+        let db = Backend::open_in_memory(2).unwrap();
+        let a = MemoryId::new();
+        let b = MemoryId::new();
+        db.add_edge(&edge(a, b, EdgeType::Related, 0.5)).unwrap();
+        db.delete_edges_for(a).unwrap();
+        assert!(db.edges_for(a, Direction::Both).unwrap().is_empty());
+        assert!(db.edges_for(b, Direction::Both).unwrap().is_empty());
+    }
+
+    // --- batch + scan ------------------------------------------------------
+
+    #[test]
+    fn batch_store_and_all_ids() {
+        let db = Backend::open_in_memory(2).unwrap();
+        let ids: Vec<MemoryId> = (0..3).map(|_| MemoryId::new()).collect();
+        let nodes: Vec<MemoryNode> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| make_node(*id, &format!("n{i}"), vec![i as f32, 1.0]))
+            .collect();
+        db.store_memory_batch(&nodes).unwrap();
+        let mut all = db.all_memory_ids().unwrap();
+        all.sort();
+        let mut expected = ids.clone();
+        expected.sort();
+        assert_eq!(all, expected);
+        assert_eq!(db.count().unwrap(), 3);
+    }
+
+    #[test]
+    fn batch_rejects_bad_dimension_before_writing() {
+        let db = Backend::open_in_memory(2).unwrap();
+        let good = make_node(MemoryId::new(), "ok", vec![1.0, 1.0]);
+        let bad = make_node(MemoryId::new(), "bad", vec![1.0, 1.0, 1.0]);
+        let res = db.store_memory_batch(&[good, bad]);
+        assert!(res.is_err());
+        // Nothing should have been written.
+        assert_eq!(db.count().unwrap(), 0);
     }
 }
