@@ -23,6 +23,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use mentedb_core::edge::EdgeType;
 use mentedb_core::error::MenteResult;
@@ -182,9 +183,11 @@ where
 /// `sqlite-vec` extension loaded for the lifetime of the backend.
 pub struct Backend {
     conn: Mutex<Connection>,
-    /// The dimension the `memory_vec` vec0 table was created with. Embeddings
-    /// of a different length are rejected by [`Backend::store_memory`].
-    embedding_dim: usize,
+    /// The dimension the `memory_vec` vec0 table was created with, or `0` when
+    /// no vector index exists yet (deferred until an embedder is configured).
+    /// Atomic because [`Backend::ensure_vector_index`] mutates it through
+    /// `&self` once the facade learns the embedding dimension.
+    embedding_dim: AtomicUsize,
 }
 
 impl Backend {
@@ -201,10 +204,10 @@ impl Backend {
         // WAL: concurrent readers don't block the writer, and crash recovery is
         // handled by SQLite instead of the old custom WAL.
         conn.pragma_update(None, "journal_mode", "WAL").map_err(store_err)?;
-        Self::init(&mut conn, embedding_dim)?;
+        let effective = Self::init(&mut conn, embedding_dim)?;
         Ok(Self {
             conn: Mutex::new(conn),
-            embedding_dim,
+            embedding_dim: AtomicUsize::new(effective),
         })
     }
 
@@ -212,15 +215,76 @@ impl Backend {
     pub fn open_in_memory(embedding_dim: usize) -> Result<Self, MenteError> {
         ensure_vec0_registered();
         let mut conn = Connection::open_in_memory().map_err(store_err)?;
-        Self::init(&mut conn, embedding_dim)?;
+        let effective = Self::init(&mut conn, embedding_dim)?;
         Ok(Self {
             conn: Mutex::new(conn),
-            embedding_dim,
+            embedding_dim: AtomicUsize::new(effective),
         })
     }
 
-    /// Create all tables/indexes and load the sqlite-vec extension. Idempotent.
-    fn init(conn: &mut Connection, embedding_dim: usize) -> Result<(), MenteError> {
+    /// The dimension the vector index was created with (0 = deferred / absent).
+    pub fn embedding_dim(&self) -> usize {
+        self.embedding_dim.load(Ordering::Relaxed)
+    }
+
+    /// Create (or recreate) the vec0 vector index at `dim` and backfill it from
+    /// the embeddings already stored in `memories.embedding`. Called by the
+    /// facade once an embedder is configured. No-op if the index already exists
+    /// at the same dimension.
+    pub fn ensure_vector_index(&self, dim: usize) -> Result<(), MenteError> {
+        if dim == 0 || dim == self.embedding_dim.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let conn = self.conn.lock();
+        // Drop any existing vec0 table (possibly at a different dim) and
+        // recreate at the requested dimension.
+        let _ = conn.execute("DROP TABLE IF EXISTS memory_vec", []);
+        conn.execute(
+            &format!("CREATE VIRTUAL TABLE memory_vec USING vec0(embedding float[{dim}])"),
+            [],
+        )
+        .map_err(store_err)?;
+
+        // Backfill from stored embeddings (normalized).
+        let mut select = conn
+            .prepare("SELECT rowid, embedding FROM memories WHERE embedding IS NOT NULL")
+            .map_err(store_err)?;
+        let rows = select
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))
+            .map_err(store_err)?;
+        let mut pairs: Vec<(i64, Vec<u8>)> = Vec::new();
+        for row in rows {
+            pairs.push(row.map_err(store_err)?);
+        }
+        drop(select);
+        for (rowid, bytes) in pairs {
+            let emb = blob_to_embedding(&bytes);
+            if emb.len() != dim {
+                continue; // skip rows that don't match the new dim
+            }
+            let norm = normalize(&emb);
+            let blob = embedding_to_blob(&norm);
+            conn.execute(
+                "INSERT INTO memory_vec (rowid, embedding) VALUES (?1, ?2)",
+                params![rowid, blob.as_slice()],
+            )
+            .map_err(store_err)?;
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('embedding_dim', ?1)",
+            params![dim.to_string()],
+        )
+        .map_err(store_err)?;
+
+        self.embedding_dim.store(dim, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Create all tables/indexes. `hint_dim` is used only on first creation; a
+    /// stored `embedding_dim` in `schema_meta` wins on reopen so the vec0
+    /// table survives across launches. Returns the effective dimension (0 means
+    /// "deferred — no vector index yet").
+    fn init(conn: &mut Connection, hint_dim: usize) -> Result<usize, MenteError> {
         // The vec0 module was registered process-globally by
         // `ensure_vec0_registered()` before this connection was opened, so the
         // `memory_vec` virtual table below will resolve automatically.
@@ -303,30 +367,39 @@ impl Backend {
         // FTS5's 'rebuild' command rescans the external content table.
         let _ = tx.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')", []);
 
-        // The vec0 dimension is fixed at table-creation time. We record the dim
-        // in schema_meta so a later open with a different embedder can detect
-        // the mismatch and rebuild this table (handled in a follow-up commit).
-        tx.execute(
-            &format!(
-                "CREATE VIRTUAL TABLE IF NOT EXISTS memory_vec USING vec0(embedding float[{embedding_dim}])"
-            ),
-            [],
-        )
-        .map_err(store_err)?;
-
+        // Resolve the effective vector dimension: a previously-stored dim wins
+        // (so the vec0 table survives reopen), otherwise fall back to the hint.
+        // `0` means "deferred" — no embedder configured yet, so no vec0 table
+        // is created until [`Backend::ensure_vector_index`] is called.
+        let stored: Option<String> = tx
+            .query_row(
+                "SELECT value FROM schema_meta WHERE key = 'embedding_dim'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(store_err)?;
+        let effective = stored
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&d| d > 0)
+            .unwrap_or(hint_dim);
+        if effective > 0 {
+            tx.execute(
+                &format!(
+                    "CREATE VIRTUAL TABLE IF NOT EXISTS memory_vec USING vec0(embedding float[{effective}])"
+                ),
+                [],
+            )
+            .map_err(store_err)?;
+        }
         tx.execute(
             "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('embedding_dim', ?1)",
-            params![embedding_dim.to_string()],
+            params![effective.to_string()],
         )
         .map_err(store_err)?;
 
         tx.commit().map_err(store_err)?;
-        Ok(())
-    }
-
-    /// The embedding dimension the vector index was created with.
-    pub fn embedding_dim(&self) -> usize {
-        self.embedding_dim
+        Ok(effective)
     }
 
     /// Persist (or update) a memory and refresh its vector + tag rows.
@@ -335,10 +408,11 @@ impl Backend {
     /// (returned unchanged by [`Self::get_memory`]); a normalized copy goes
     /// into the `vec0` table so KNN behaves as cosine similarity.
     pub fn store_memory(&self, node: &MemoryNode) -> Result<(), MenteError> {
-        if !node.embedding.is_empty() && node.embedding.len() != self.embedding_dim {
+        let dim = self.embedding_dim.load(Ordering::Relaxed);
+        if !node.embedding.is_empty() && dim > 0 && node.embedding.len() != dim {
             return Err(MenteError::EmbeddingDimensionMismatch {
                 got: node.embedding.len(),
-                expected: self.embedding_dim,
+                expected: dim,
             });
         }
 
@@ -409,7 +483,7 @@ impl Backend {
             "DELETE FROM memory_vec WHERE rowid = ?1",
             params![rowid],
         );
-        if !node.embedding.is_empty() {
+        if dim > 0 && !node.embedding.is_empty() {
             // Store a normalized copy so L2 KNN approximates cosine ranking.
             let norm = normalize(&node.embedding);
             let norm_blob = embedding_to_blob(&norm);
@@ -531,7 +605,7 @@ impl Backend {
     /// Returns `(MemoryId, cosine_similarity)` pairs, most similar first. The
     /// query vector is normalized internally; `similarity` is in `[0, 1]`.
     pub fn knn(&self, query: &[f32], k: usize) -> Result<Vec<(MemoryId, f32)>, MenteError> {
-        if k == 0 || query.is_empty() {
+        if k == 0 || query.is_empty() || self.embedding_dim.load(Ordering::Relaxed) == 0 {
             return Ok(Vec::new());
         }
         let conn = self.conn.lock();
@@ -764,11 +838,15 @@ impl Backend {
     ///
     /// [`store_memory`]: Backend::store_memory
     pub fn store_memory_batch(&self, nodes: &[MemoryNode]) -> Result<(), MenteError> {
+        let dim = self.embedding_dim.load(Ordering::Relaxed);
+        // Validate up front so a bad row aborts before any write. Only enforce
+        // when a vector index exists (dim > 0); a deferred index accepts any
+        // length until `ensure_vector_index` is called.
         for n in nodes {
-            if !n.embedding.is_empty() && n.embedding.len() != self.embedding_dim {
+            if dim > 0 && !n.embedding.is_empty() && n.embedding.len() != dim {
                 return Err(MenteError::EmbeddingDimensionMismatch {
                     got: n.embedding.len(),
-                    expected: self.embedding_dim,
+                    expected: dim,
                 });
             }
         }
@@ -1379,5 +1457,37 @@ mod tests {
         let res = db.hybrid_search(&[1.0, 0.0], None, Some((400, 600)), 10).unwrap();
         assert_eq!(res.len(), 1);
         assert_eq!(res[0].0, b);
+    }
+
+    // --- deferred vector index --------------------------------------------
+
+    #[test]
+    fn deferred_index_backfills_on_ensure_vector_index() {
+        // Open with dim 0 (no embedder configured yet): embeddings are still
+        // stored, but there is no vector index so KNN returns nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mem.sqlite");
+        let id = MemoryId::new();
+
+        {
+            let db = Backend::open(&path, 0).unwrap();
+            assert_eq!(db.embedding_dim(), 0);
+            db.store_memory(&make_node(id, "deferred", vec![1.0, 0.0])).unwrap();
+            // No vec0 yet → KNN unavailable.
+            assert!(db.knn(&[1.0, 0.0], 5).unwrap().is_empty());
+            // Configuring the embedder builds the index and backfills.
+            db.ensure_vector_index(2).unwrap();
+            assert_eq!(db.embedding_dim(), 2);
+            let hits = db.knn(&[1.0, 0.0], 5).unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].0, id);
+        }
+
+        // On reopen the stored dim wins, so the index is ready immediately.
+        let db = Backend::open(&path, 0).unwrap();
+        assert_eq!(db.embedding_dim(), 2);
+        let hits = db.knn(&[1.0, 0.0], 5).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, id);
     }
 }
