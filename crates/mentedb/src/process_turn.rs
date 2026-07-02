@@ -367,10 +367,8 @@ impl MenteDb {
         let hybrid_ids: std::collections::HashSet<MemoryId> =
             scored.iter().map(|sm| sm.memory.id).collect();
         let always_scope_tag = "scope:always";
-        let pm = self.page_map.read();
-        for pid in pm.values() {
-            if let Ok(mem) = self.storage.load_memory(*pid)
-                && mem.tags.iter().any(|t| t == always_scope_tag)
+        for mem in self.db.all_memories().unwrap_or_default() {
+            if mem.tags.iter().any(|t| t == always_scope_tag)
                 && !hybrid_ids.contains(&mem.id)
             {
                 scored.push(ScoredMemory {
@@ -379,7 +377,6 @@ impl MenteDb {
                 });
             }
         }
-        drop(pm);
 
         let ids: Vec<MemoryId> = scored.iter().map(|sm| sm.memory.id).collect();
         Ok((scored, ids, false))

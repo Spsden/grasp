@@ -677,6 +677,38 @@ impl Backend {
         Ok(())
     }
 
+    /// Load every edge in the graph. Used at open time to hydrate the in-memory
+    /// `GraphManager` from the SQLite source of truth.
+    pub fn all_edges(&self) -> Result<Vec<MemoryEdge>, MenteError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT source, target, edge_type, weight, created_at, valid_from, valid_until, label FROM edges",
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(MemoryEdge {
+                    source: parse_id::<MemoryId>(&row.get::<_, String>(0)?)
+                        .unwrap_or_else(|_| MemoryId::nil()),
+                    target: parse_id::<MemoryId>(&row.get::<_, String>(1)?)
+                        .unwrap_or_else(|_| MemoryId::nil()),
+                    edge_type: parse_edge_type(&row.get::<_, String>(2)?),
+                    weight: row.get::<_, f64>(3)? as f32,
+                    created_at: row.get::<_, i64>(4)? as u64,
+                    valid_from: row.get::<_, Option<i64>>(5)?.map(|t| t as u64),
+                    valid_until: row.get::<_, Option<i64>>(6)?.map(|t| t as u64),
+                    label: row.get::<_, Option<String>>(7)?,
+                })
+            })
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(store_err)?);
+        }
+        Ok(out)
+    }
+
     /// Load every edge touching `id` from the chosen direction(s).
     pub fn edges_for(&self, id: MemoryId, dir: Direction) -> Result<Vec<MemoryEdge>, MenteError> {
         let conn = self.conn.lock();
@@ -826,6 +858,19 @@ impl Backend {
         let mut out = Vec::new();
         for row in rows {
             out.push(row.map_err(store_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Every stored memory (with tags). Replaces the common facade pattern of
+    /// `page_map.values().map(|pid| storage.load_memory(pid))`.
+    pub fn all_memories(&self) -> Result<Vec<MemoryNode>, MenteError> {
+        let ids = self.all_memory_ids()?;
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(node) = self.get_memory(id)? {
+                out.push(node);
+            }
         }
         Ok(out)
     }

@@ -67,9 +67,8 @@ use mentedb_core::types::{MemoryId, Timestamp};
 use mentedb_core::{MemoryEdge, MemoryNode, MenteError};
 use mentedb_embedding::provider::EmbeddingProvider;
 use mentedb_graph::GraphManager;
-use mentedb_index::IndexManager;
 use mentedb_query::{Mql, QueryPlan};
-use mentedb_storage::StorageEngine;
+use mentedb_sqlite::Backend;
 use parking_lot::RwLock;
 use tracing::{debug, info, warn};
 
@@ -125,8 +124,6 @@ pub mod prelude {
     pub use crate::MenteDb;
 }
 
-use mentedb_storage::PageId;
-/// Mapping from MemoryId to the storage PageId where it lives.
 use std::collections::HashMap;
 
 /// Configuration for sleeptime enrichment pipeline.
@@ -291,12 +288,16 @@ impl Default for CognitiveConfig {
 /// takes `&self`. This allows `Arc<MenteDb>` to be shared across threads without
 /// an external `RwLock`.
 pub struct MenteDb {
-    storage: StorageEngine,
-    index: IndexManager,
+    /// SQLite + sqlite-vec storage/index backend. Replaces StorageEngine +
+    /// IndexManager + the MemoryId->PageId map. The single source of truth for
+    /// memories, vectors, tags, and edges.
+    db: Backend,
+    /// In-memory knowledge graph (CSR/CSC), hydrated from `db` on open and
+    /// kept write-through on `relate`. Kept in-memory because the cognitive
+    /// engines (belief propagation, contradiction traversal, supersede
+    /// filtering) read it on every recall.
     graph: GraphManager,
-    /// Maps memory IDs to their storage page IDs for retrieval.
-    page_map: RwLock<HashMap<MemoryId, PageId>>,
-    /// Expected embedding dimension (0 = no validation).
+    /// Expected embedding dimension (0 = no embedder configured yet).
     embedding_dim: usize,
     /// Database directory path for persistence.
     path: PathBuf,
@@ -343,33 +344,27 @@ impl MenteDb {
     /// Opens a MenteDB instance with custom cognitive configuration.
     pub fn open_with_config(path: &Path, cognitive_config: CognitiveConfig) -> MenteResult<Self> {
         info!("Opening MenteDB at {}", path.display());
-        let storage = StorageEngine::open(path)?;
+        std::fs::create_dir_all(path)?;
+        // All durable state lives in one SQLite file. Open with dim 0
+        // (deferred); the vec0 index is (re)created when an embedder is
+        // attached via set_embedder / open_with_embedder.
+        let db = Backend::open(&path.join("memory.sqlite"), 0)?;
 
-        let index_dir = path.join("indexes");
-        let graph_dir = path.join("graph");
-
-        let index = if index_dir.join("hnsw.bin").exists() || index_dir.join("hnsw.json").exists() {
-            debug!("Loading indexes from {}", index_dir.display());
-            IndexManager::load(&index_dir)?
-        } else {
-            IndexManager::default()
-        };
-
-        let graph = if graph_dir.join("graph.json").exists() {
-            debug!("Loading graph from {}", graph_dir.display());
-            GraphManager::load(&graph_dir)?
-        } else {
-            GraphManager::new()
-        };
-
-        // Rebuild page map by scanning all pages
-        let entries = storage.scan_all_memories();
-        let mut page_map = HashMap::new();
-        for (memory_id, page_id) in &entries {
-            page_map.insert(*memory_id, *page_id);
+        // Hydrate the in-memory graph from the SQLite edge store (source of
+        // truth) and register every memory as a graph node.
+        let graph = GraphManager::new();
+        for id in db.all_memory_ids()? {
+            graph.add_memory(id);
         }
-        if !page_map.is_empty() {
-            info!(memories = page_map.len(), "rebuilt page map from storage");
+        for edge in db.all_edges()? {
+            // add_relationship persists nothing here; SQLite already holds the
+            // edge. We mirror it into the CSR for the graph algorithms.
+            let _ = graph.add_relationship(&edge);
+        }
+        if let Ok(ids) = db.all_memory_ids() {
+            if !ids.is_empty() {
+                info!(memories = ids.len(), "hydrated graph from sqlite store");
+            }
         }
 
         let write_inference =
@@ -408,10 +403,8 @@ impl MenteDb {
         }
 
         Ok(Self {
-            storage,
-            index,
+            db,
             graph,
-            page_map: RwLock::new(page_map),
             embedding_dim: 0,
             path: path.to_path_buf(),
             embedder: None,
@@ -451,15 +444,20 @@ impl MenteDb {
         cognitive_config: CognitiveConfig,
     ) -> MenteResult<Self> {
         let mut db = Self::open_with_config(path, cognitive_config)?;
-        db.embedding_dim = embedder.dimensions();
-        db.embedder = Some(embedder);
+        db.set_embedder(embedder);
         Ok(db)
     }
 
-    /// Set the embedding provider after construction.
+    /// Set the embedding provider after construction and (re)build the vec0
+    /// vector index at the provider's dimension, backfilling any memories
+    /// already stored.
     pub fn set_embedder(&mut self, embedder: Box<dyn EmbeddingProvider>) {
         self.embedding_dim = embedder.dimensions();
+        let dim = self.embedding_dim;
         self.embedder = Some(embedder);
+        if let Err(e) = self.db.ensure_vector_index(dim) {
+            warn!("Failed to (re)build vector index at dim {dim}: {e}");
+        }
     }
 
     /// Generate an embedding for the given text using the configured provider.
@@ -486,20 +484,25 @@ impl MenteDb {
         let id = node.id;
         debug!("Storing memory {}", id);
 
+        // Auto-provision the vector index from the first embedding seen. This
+        // covers callers that embed themselves without configuring an
+        // EmbeddingProvider (tests, bulk import, direct API use).
+        if !node.embedding.is_empty() && self.db.embedding_dim() == 0 {
+            self.db.ensure_vector_index(node.embedding.len())?;
+        }
+
         // Validate embedding dimension when configured.
-        if self.embedding_dim > 0
-            && !node.embedding.is_empty()
-            && node.embedding.len() != self.embedding_dim
-        {
+        let dim = self.db.embedding_dim();
+        if dim > 0 && !node.embedding.is_empty() && node.embedding.len() != dim {
             return Err(MenteError::EmbeddingDimensionMismatch {
                 got: node.embedding.len(),
-                expected: self.embedding_dim,
+                expected: dim,
             });
         }
 
-        let page_id = self.storage.store_memory(&node)?;
-        self.page_map.write().insert(id, page_id);
-        self.index.index_memory(&node);
+        // Persist (upsert) the memory, its vector row, and its tags. SQLite
+        // triggers keep the FTS5 mirror in sync automatically.
+        self.db.store_memory(&node)?;
         self.graph.add_memory(id);
 
         // Run write inference to auto-create edges and detect contradictions.
@@ -516,30 +519,37 @@ impl MenteDb {
     /// flock acquisition, header reload, and LSN scan. Significantly faster
     /// for bulk inserts.
     pub fn store_batch(&self, nodes: Vec<MemoryNode>) -> MenteResult<Vec<MemoryId>> {
+        // Auto-provision the vector index from the first embedding seen.
+        if let Some(first_dim) = nodes.iter().find_map(|n| {
+            if n.embedding.is_empty() {
+                None
+            } else {
+                Some(n.embedding.len())
+            }
+        }) {
+            if self.db.embedding_dim() == 0 {
+                self.db.ensure_vector_index(first_dim)?;
+            }
+        }
+
+        let dim = self.db.embedding_dim();
         // Validate all embeddings upfront
         for node in &nodes {
-            if self.embedding_dim > 0
-                && !node.embedding.is_empty()
-                && node.embedding.len() != self.embedding_dim
-            {
+            if dim > 0 && !node.embedding.is_empty() && node.embedding.len() != dim {
                 return Err(MenteError::EmbeddingDimensionMismatch {
                     got: node.embedding.len(),
-                    expected: self.embedding_dim,
+                    expected: dim,
                 });
             }
         }
 
-        let page_ids = self.storage.store_memory_batch(&nodes)?;
+        self.db.store_memory_batch(&nodes)?;
 
         let mut ids = Vec::with_capacity(nodes.len());
-        let mut page_map = self.page_map.write();
-        for (node, page_id) in nodes.iter().zip(page_ids.iter()) {
-            page_map.insert(node.id, *page_id);
-            self.index.index_memory(node);
+        for node in &nodes {
             self.graph.add_memory(node.id);
             ids.push(node.id);
         }
-        drop(page_map);
 
         Ok(ids)
     }
@@ -650,16 +660,15 @@ impl MenteDb {
             tags_or
         );
         // Over-fetch to account for filtered-out results
-        let results = self.index.hybrid_search_with_query_mode(
+        let results = self.db.hybrid_search_with_query_mode(
             embedding,
             query_text,
             tags,
             tags_or,
             time_range,
             k * 3,
-        );
+        )?;
         let graph = self.graph.graph();
-        let pm = self.page_map.read();
         let filtered: Vec<(MemoryId, f32)> = results
             .into_iter()
             .filter(|(id, _)| {
@@ -671,12 +680,10 @@ impl MenteDb {
                 !has_active_supersede
             })
             .filter(|(id, _)| {
-                if let Some(&page_id) = pm.get(id)
-                    && let Ok(node) = self.storage.load_memory(page_id)
-                {
-                    node.is_valid_at(at)
-                } else {
-                    true
+                // Temporal validity: exclude memories not valid at `at`.
+                match self.db.get_memory(*id) {
+                    Ok(Some(node)) => node.is_valid_at(at),
+                    _ => true,
                 }
             })
             .take(k)
@@ -755,59 +762,49 @@ impl MenteDb {
     /// from current recall results.
     pub fn invalidate_memory(&self, id: MemoryId, at: Timestamp) -> MenteResult<()> {
         debug!("Invalidating memory {} at {}", id, at);
-        let page_id = self
-            .page_map
-            .read()
-            .get(&id)
-            .copied()
+        let mut node = self
+            .db
+            .get_memory(id)?
             .ok_or(MenteError::MemoryNotFound(id))?;
-        let mut node = self.storage.load_memory(page_id)?;
         node.invalidate(at);
-        let new_page_id = self.storage.store_memory(&node)?;
-        self.page_map.write().insert(id, new_page_id);
+        self.db.store_memory(&node)?;
         Ok(())
     }
 
     /// Adds a typed, weighted edge between two memories in the graph.
     pub fn relate(&self, edge: MemoryEdge) -> MenteResult<()> {
         debug!("Relating {} -> {}", edge.source, edge.target);
+        // SQLite is the source of truth; mirror into the in-memory graph for
+        // the cognitive algorithms.
+        self.db.add_edge(&edge)?;
         self.graph.add_relationship(&edge)?;
         Ok(())
     }
 
     /// Retrieves a single memory by its ID.
     pub fn get_memory(&self, id: MemoryId) -> MenteResult<MemoryNode> {
-        let page_id = self
-            .page_map
-            .read()
-            .get(&id)
-            .copied()
-            .ok_or(MenteError::MemoryNotFound(id))?;
-        self.storage.load_memory(page_id)
+        self.db
+            .get_memory(id)?
+            .ok_or(MenteError::MemoryNotFound(id))
     }
 
     /// Returns all memory IDs currently stored in the database.
     pub fn memory_ids(&self) -> Vec<MemoryId> {
-        self.page_map.read().keys().copied().collect()
+        self.db.all_memory_ids().unwrap_or_default()
     }
 
     /// Returns the number of memories currently stored.
     pub fn memory_count(&self) -> usize {
-        self.page_map.read().len()
+        self.db.count().unwrap_or(0)
     }
 
-    /// Removes a memory from storage, indexes, and the graph.
+    /// Removes a memory from storage, its vector row, tags, and edges, and
+    /// drops it from the in-memory graph.
     pub fn forget(&self, id: MemoryId) -> MenteResult<()> {
         debug!("Forgetting memory {}", id);
-
-        if let Some(&page_id) = self.page_map.read().get(&id)
-            && let Ok(node) = self.storage.load_memory(page_id)
-        {
-            self.index.remove_memory(id, &node);
-        }
-
+        let _ = self.db.delete_memory(id);
+        let _ = self.db.delete_edges_for(id);
         self.graph.remove_memory(id);
-        self.page_map.write().remove(&id);
         Ok(())
     }
 
@@ -855,16 +852,11 @@ impl MenteDb {
         }
 
         // Load the actual MemoryNode data for each candidate.
-        let pm = self.page_map.read();
         let existing: Vec<MemoryNode> = candidates
             .iter()
             .filter(|(id, _)| *id != new_memory.id)
-            .filter_map(|(id, _)| {
-                pm.get(id)
-                    .and_then(|&pid| self.storage.load_memory(pid).ok())
-            })
+            .filter_map(|(id, _)| self.db.get_memory(*id).ok().flatten())
             .collect();
-        drop(pm);
 
         if existing.is_empty() {
             return;
@@ -915,7 +907,7 @@ impl MenteDb {
                     "Auto-creating {:?} edge {} -> {}",
                     edge_type, source, target
                 );
-                self.graph.add_relationship(&edge)?;
+                self.relate(edge)?;
             }
             InferredAction::InvalidateMemory {
                 memory,
@@ -927,7 +919,7 @@ impl MenteDb {
                     memory, superseded_by
                 );
                 self.invalidate_memory(memory, valid_until)?;
-                // Also create the Supersedes edge.
+                // Also persist the Supersedes edge (db + in-memory graph).
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -942,7 +934,7 @@ impl MenteDb {
                     valid_until: None,
                     label: None,
                 };
-                self.graph.add_relationship(&edge)?;
+                self.relate(edge)?;
             }
             InferredAction::MarkObsolete {
                 memory,
@@ -967,7 +959,7 @@ impl MenteDb {
                     valid_until: None,
                     label: None,
                 };
-                self.graph.add_relationship(&edge)?;
+                self.relate(edge)?;
             }
             InferredAction::FlagContradiction {
                 existing,
@@ -992,7 +984,7 @@ impl MenteDb {
                     valid_until: None,
                     label: Some(reason),
                 };
-                self.graph.add_relationship(&edge)?;
+                self.relate(edge)?;
             }
             InferredAction::UpdateConfidence {
                 memory,
@@ -1001,8 +993,7 @@ impl MenteDb {
                 debug!("Updating confidence for {} to {}", memory, new_confidence);
                 if let Ok(mut node) = self.get_memory(memory) {
                     node.confidence = new_confidence;
-                    let new_page_id = self.storage.store_memory(&node)?;
-                    self.page_map.write().insert(memory, new_page_id);
+                    self.db.store_memory(&node)?;
                 }
             }
             InferredAction::PropagateBeliefChange { root, delta } => {
@@ -1013,9 +1004,7 @@ impl MenteDb {
                     for (affected_id, new_conf) in affected {
                         if let Ok(mut affected_node) = self.get_memory(affected_id) {
                             affected_node.confidence = new_conf;
-                            if let Ok(pid) = self.storage.store_memory(&affected_node) {
-                                self.page_map.write().insert(affected_id, pid);
-                            }
+                            let _ = self.db.store_memory(&affected_node);
                         }
                     }
                 }
@@ -1028,10 +1017,9 @@ impl MenteDb {
                 debug!("Updating content of {}: {}", memory, reason);
                 if let Ok(mut node) = self.get_memory(memory) {
                     node.content = new_content;
-                    let new_page_id = self.storage.store_memory(&node)?;
-                    self.page_map.write().insert(memory, new_page_id);
-                    self.index.remove_memory(memory, &node);
-                    self.index.index_memory(&node);
+                    // The db upsert refreshes the FTS5 mirror (via trigger) and
+                    // the vec0 row, so no separate index call is needed.
+                    self.db.store_memory(&node)?;
                 }
             }
         }
@@ -1078,16 +1066,11 @@ impl MenteDb {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_micros() as u64;
-        let ids: Vec<(MemoryId, PageId)> = self
-            .page_map
-            .read()
-            .iter()
-            .map(|(mid, pid)| (*mid, *pid))
-            .collect();
+        let ids = self.db.all_memory_ids()?;
 
         let mut updated = 0;
-        for (mid, pid) in &ids {
-            if let Ok(mut node) = self.storage.load_memory(*pid) {
+        for id in ids {
+            if let Ok(Some(mut node)) = self.db.get_memory(id) {
                 let new_salience = self.decay.compute_decay(
                     node.salience,
                     node.created_at,
@@ -1097,8 +1080,7 @@ impl MenteDb {
                 );
                 if (new_salience - node.salience).abs() > 0.001 {
                     node.salience = new_salience;
-                    let new_pid = self.storage.store_memory(&node)?;
-                    self.page_map.write().insert(*mid, new_pid);
+                    self.db.store_memory(&node)?;
                     updated += 1;
                 }
             }
@@ -1128,13 +1110,12 @@ impl MenteDb {
             .as_micros() as u64;
 
         // Load all memories eligible for consolidation.
-        let pm = self.page_map.read();
-        let eligible: Vec<MemoryNode> = pm
-            .values()
-            .filter_map(|pid| self.storage.load_memory(*pid).ok())
+        let eligible: Vec<MemoryNode> = self
+            .db
+            .all_memories()?
+            .into_iter()
             .filter(|node| ConsolidationEngine::should_consolidate(node, now))
             .collect();
-        drop(pm);
 
         if eligible.is_empty() {
             return Ok(vec![]);
@@ -1150,15 +1131,10 @@ impl MenteDb {
     /// The source memories are invalidated (not deleted) and a new consolidated
     /// semantic memory is stored with Derived edges back to the sources.
     pub fn consolidate_cluster(&self, memory_ids: &[MemoryId]) -> MenteResult<MemoryId> {
-        let pm = self.page_map.read();
         let cluster: Vec<MemoryNode> = memory_ids
             .iter()
-            .filter_map(|id| {
-                pm.get(id)
-                    .and_then(|&pid| self.storage.load_memory(pid).ok())
-            })
+            .filter_map(|id| self.db.get_memory(*id).ok().flatten())
             .collect();
-        drop(pm);
 
         if cluster.len() < 2 {
             return Err(MenteError::Query(
@@ -1198,7 +1174,7 @@ impl MenteDb {
                 valid_until: None,
                 label: None,
             };
-            let _ = self.graph.add_relationship(&edge);
+            let _ = self.relate(edge);
         }
 
         info!(
@@ -1213,55 +1189,58 @@ impl MenteDb {
     pub fn close(&self) -> MenteResult<()> {
         info!("Closing MenteDB");
         self.flush()?;
-        self.storage.close()?;
+        // The SQLite connection is closed when MenteDb is dropped; nothing
+        // explicit to do here now that the bespoke WAL/page engine is gone.
         Ok(())
     }
 
     /// Rebuild all indexes by scanning every memory in storage.
     ///
-    /// Use this after index corruption or when index files were overwritten.
-    /// Returns the number of memories re-indexed.
+    /// SQLite keeps the FTS5 mirror (via triggers) and the vec0 index (via
+    /// store-time updates) in sync automatically, so this is largely a no-op:
+    /// we just re-affirm the vector index at the configured dimension.
+    /// Returns the number of memories.
     pub fn rebuild_indexes(&self) -> MenteResult<usize> {
-        info!("Rebuilding indexes from storage...");
-        let ids: Vec<MemoryId> = self.page_map.read().keys().copied().collect();
-        let total = ids.len();
-        let mut indexed = 0usize;
-        for id in ids {
-            if let Ok(node) = self.get_memory(id) {
-                self.index.index_memory(&node);
-                indexed += 1;
-            }
+        info!("Rebuilding indexes...");
+        let total = self.db.count()?;
+        let dim = if self.embedding_dim > 0 {
+            self.embedding_dim
+        } else {
+            self.db.embedding_dim()
+        };
+        if dim > 0 {
+            // Force a rebuild by dropping to 0 first would lose data; instead
+            // rely on ensure_vector_index being idempotent when dim matches,
+            // and only act if no index exists yet.
+            let _ = self.db.ensure_vector_index(dim);
         }
-        self.index.save(&self.path.join("indexes"))?;
-        info!(indexed, total, "index rebuild complete");
-        Ok(indexed)
+        info!(indexed = total, total, "index rebuild complete (sqlite indexes are self-maintaining)");
+        Ok(total)
     }
 
-    /// Flush indexes, graph, and storage to disk without closing.
+    /// Persist cognitive subsystem state to disk without closing.
     ///
-    /// Call this periodically to ensure cross-session persistence.
-    /// Unlike `close()`, the database remains usable after flushing.
+    /// Memories, vectors, tags, and edges are already durable in SQLite (WAL)
+    /// the moment they are written, so this only flushes the cognitive
+    /// subsystems that still keep their own JSON state (trajectory,
+    /// speculative cache, entity resolver).
     pub fn flush(&self) -> MenteResult<()> {
-        debug!("Flushing MenteDB to disk");
-        self.index.save(&self.path.join("indexes"))?;
-        self.graph.save(&self.path.join("graph"))?;
-        self.storage.checkpoint()?;
-
+        debug!("Flushing cognitive subsystem state");
         // Persist cognitive subsystem state.
         let cognitive_dir = self.path.join("cognitive");
         if std::fs::create_dir_all(&cognitive_dir).is_ok() {
             let _ = self
                 .trajectory
-                .read()
+                .write()
                 .transitions
                 .save(&cognitive_dir.join("transitions.json"), 1);
             let _ = self
                 .speculative
-                .read()
+                .write()
                 .save(&cognitive_dir.join("speculative.json"), 0);
             let _ = self
                 .entity_resolver
-                .read()
+                .write()
                 .save(&cognitive_dir.join("entities.json"));
         }
         Ok(())
@@ -1271,46 +1250,40 @@ impl MenteDb {
     fn execute_plan(&self, plan: &QueryPlan) -> MenteResult<Vec<ScoredMemory>> {
         match plan {
             QueryPlan::VectorSearch { query, k, .. } => {
-                let hits = self.index.hybrid_search(query, None, None, *k);
+                let hits = self.db.hybrid_search(query, None, None, *k)?;
                 self.load_scored_memories(&hits)
             }
             QueryPlan::TagScan { tags, limit, .. } => {
                 let tag_refs: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
                 let k = limit.unwrap_or(10);
                 // Use a zero-vector for tag-only search; salience+bitmap still apply.
-                let hits = self.index.hybrid_search(&[], Some(&tag_refs), None, k);
+                let hits = self.db.hybrid_search(&[], Some(&tag_refs), None, k)?;
                 self.load_scored_memories(&hits)
             }
             QueryPlan::TemporalScan { start, end, .. } => {
                 let hits = self
-                    .index
-                    .hybrid_search(&[], None, Some((*start, *end)), 100);
+                    .db
+                    .hybrid_search(&[], None, Some((*start, *end)), 100)?;
                 self.load_scored_memories(&hits)
             }
             QueryPlan::GraphTraversal { start, depth, .. } => {
                 let (ids, _edges) = self.graph.get_context_subgraph(*start, *depth);
-                let pm = self.page_map.read();
                 let scored: Vec<ScoredMemory> = ids
                     .iter()
                     .filter_map(|id| {
-                        pm.get(id).and_then(|&pid| {
-                            self.storage.load_memory(pid).ok().map(|node| ScoredMemory {
-                                memory: node,
-                                score: 1.0,
-                            })
+                        self.db.get_memory(*id).ok().flatten().map(|node| ScoredMemory {
+                            memory: node,
+                            score: 1.0,
                         })
                     })
                     .collect();
                 Ok(scored)
             }
             QueryPlan::PointLookup { id } => {
-                let page_id = self
-                    .page_map
-                    .read()
-                    .get(id)
-                    .copied()
+                let node = self
+                    .db
+                    .get_memory(*id)?
                     .ok_or(MenteError::MemoryNotFound(*id))?;
-                let node = self.storage.load_memory(page_id)?;
                 Ok(vec![ScoredMemory {
                     memory: node,
                     score: 1.0,
@@ -1325,7 +1298,6 @@ impl MenteDb {
     /// When decay is enabled, salience is recomputed and factored into the
     /// final score to prioritize temporally relevant memories.
     fn load_scored_memories(&self, hits: &[(MemoryId, f32)]) -> MenteResult<Vec<ScoredMemory>> {
-        let pm = self.page_map.read();
         let now = if self.cognitive_config.decay_on_recall {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1337,9 +1309,7 @@ impl MenteDb {
 
         let mut scored = Vec::with_capacity(hits.len());
         for &(id, score) in hits {
-            if let Some(&page_id) = pm.get(&id)
-                && let Ok(node) = self.storage.load_memory(page_id)
-            {
+            if let Ok(Some(node)) = self.db.get_memory(id) {
                 let final_score = if self.cognitive_config.decay_on_recall {
                     let decayed_salience = self.decay.compute_decay(
                         node.salience,
@@ -1704,12 +1674,7 @@ impl MenteDb {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_micros() as u64;
-        let pm = self.page_map.read();
-        let memories: Vec<MemoryNode> = pm
-            .values()
-            .filter_map(|pid| self.storage.load_memory(*pid).ok())
-            .collect();
-        drop(pm);
+        let memories: Vec<MemoryNode> = self.db.all_memories()?;
         Ok(self.archival.evaluate_batch(&memories, now))
     }
 
@@ -1741,10 +1706,11 @@ impl MenteDb {
     /// sorted by creation time. These are the candidates for LLM extraction.
     pub fn enrichment_candidates(&self) -> Vec<MemoryNode> {
         let last_turn = *self.last_enrichment_turn.read();
-        let page_ids: Vec<PageId> = self.page_map.read().values().copied().collect();
-        let mut candidates: Vec<MemoryNode> = page_ids
-            .iter()
-            .filter_map(|pid| self.storage.load_memory(*pid).ok())
+        let mut candidates: Vec<MemoryNode> = self
+            .db
+            .all_memories()
+            .unwrap_or_default()
+            .into_iter()
             .filter(|m| {
                 m.memory_type == mentedb_core::memory::MemoryType::Episodic
                     && !m.tags.contains(&"source:enrichment".to_string())
@@ -1832,14 +1798,11 @@ impl MenteDb {
     /// Returns deduplicated, normalized entity names extracted from
     /// `entity:{name}` tags across all stored memories.
     pub fn all_entity_names(&self) -> Vec<String> {
-        let page_ids: Vec<PageId> = self.page_map.read().values().copied().collect();
         let mut names = std::collections::HashSet::new();
-        for pid in &page_ids {
-            if let Ok(mem) = self.storage.load_memory(*pid) {
-                for tag in &mem.tags {
-                    if let Some(name) = tag.strip_prefix("entity:") {
-                        names.insert(name.to_lowercase().trim().to_string());
-                    }
+        for mem in self.db.all_memories().unwrap_or_default() {
+            for tag in &mem.tags {
+                if let Some(name) = tag.strip_prefix("entity:") {
+                    names.insert(name.to_lowercase().trim().to_string());
                 }
             }
         }
@@ -1863,31 +1826,28 @@ impl MenteDb {
     /// The content helps the LLM disambiguate (e.g., "Python" near
     /// "web framework" vs "Python" near "Monty Python").
     pub fn entity_names_with_context(&self) -> Vec<(String, Option<String>)> {
-        let page_ids: Vec<PageId> = self.page_map.read().values().copied().collect();
         let mut entity_contexts: HashMap<String, String> = HashMap::new();
 
-        for pid in &page_ids {
-            if let Ok(mem) = self.storage.load_memory(*pid) {
-                for tag in &mem.tags {
-                    if let Some(name) = tag.strip_prefix("entity:") {
-                        let normalized = name.to_lowercase().trim().to_string();
-                        // One entity tag per memory (enrichment creates separate memories per entity)
-                        entity_contexts
-                            .entry(normalized)
-                            .and_modify(|existing| {
-                                // Append content from multiple mentions, cap at ~500 chars
-                                if existing.len() < 300 {
-                                    existing.push_str(" | ");
-                                    let remaining = 500usize.saturating_sub(existing.len());
-                                    existing
-                                        .push_str(&mem.content[..mem.content.len().min(remaining)]);
-                                }
-                            })
-                            .or_insert_with(|| {
-                                mem.content[..mem.content.len().min(300)].to_string()
-                            });
-                        break;
-                    }
+        for mem in self.db.all_memories().unwrap_or_default() {
+            for tag in &mem.tags {
+                if let Some(name) = tag.strip_prefix("entity:") {
+                    let normalized = name.to_lowercase().trim().to_string();
+                    // One entity tag per memory (enrichment creates separate memories per entity)
+                    entity_contexts
+                        .entry(normalized)
+                        .and_modify(|existing| {
+                            // Append content from multiple mentions, cap at ~500 chars
+                            if existing.len() < 300 {
+                                existing.push_str(" | ");
+                                let remaining = 500usize.saturating_sub(existing.len());
+                                existing
+                                    .push_str(&mem.content[..mem.content.len().min(remaining)]);
+                            }
+                        })
+                        .or_insert_with(|| {
+                            mem.content[..mem.content.len().min(300)].to_string()
+                        });
+                    break;
                 }
             }
         }
@@ -2120,17 +2080,14 @@ impl MenteDb {
 
     /// Build a map of normalized entity name → list of MemoryIds.
     fn build_entity_memory_map(&self) -> HashMap<String, Vec<MemoryId>> {
-        let page_ids: Vec<PageId> = self.page_map.read().values().copied().collect();
         let mut map: HashMap<String, Vec<MemoryId>> = HashMap::new();
-        for pid in &page_ids {
-            if let Ok(mem) = self.storage.load_memory(*pid) {
-                for tag in &mem.tags {
-                    if let Some(name) = tag.strip_prefix("entity:") {
-                        let normalized = name.to_lowercase().trim().to_string();
-                        // One entity tag per memory (enrichment creates separate memories per entity)
-                        map.entry(normalized).or_default().push(mem.id);
-                        break;
-                    }
+        for mem in self.db.all_memories().unwrap_or_default() {
+            for tag in &mem.tags {
+                if let Some(name) = tag.strip_prefix("entity:") {
+                    let normalized = name.to_lowercase().trim().to_string();
+                    // One entity tag per memory (enrichment creates separate memories per entity)
+                    map.entry(normalized).or_default().push(mem.id);
+                    break;
                 }
             }
         }
@@ -2139,10 +2096,10 @@ impl MenteDb {
 
     /// Get all entity memory nodes (memories tagged with `entity:{name}`).
     pub fn entity_memories(&self) -> Vec<MemoryNode> {
-        let page_ids: Vec<PageId> = self.page_map.read().values().copied().collect();
-        page_ids
-            .iter()
-            .filter_map(|pid| self.storage.load_memory(*pid).ok())
+        self.db
+            .all_memories()
+            .unwrap_or_default()
+            .into_iter()
             .filter(|m| m.tags.iter().any(|t| t.starts_with("entity:")))
             .collect()
     }
@@ -2152,36 +2109,33 @@ impl MenteDb {
     /// Returns a map of category → list of (entity_name, context_snippet).
     /// Categories come from `entity_type:` tags on entity memories.
     pub fn entity_communities(&self) -> HashMap<String, Vec<(String, String)>> {
-        let page_ids: Vec<PageId> = self.page_map.read().values().copied().collect();
         let mut categories: HashMap<String, Vec<(String, String)>> = HashMap::new();
 
-        for pid in &page_ids {
-            if let Ok(mem) = self.storage.load_memory(*pid) {
-                // Skip non-entity memories and existing community summaries
-                if mem.tags.iter().any(|t| t == "community_summary") {
-                    continue;
-                }
+        for mem in self.db.all_memories().unwrap_or_default() {
+            // Skip non-entity memories and existing community summaries
+            if mem.tags.iter().any(|t| t == "community_summary") {
+                continue;
+            }
 
-                let entity_name = mem
+            let entity_name = mem
+                .tags
+                .iter()
+                .find_map(|t| t.strip_prefix("entity:"))
+                .map(|n| n.to_string());
+
+            if let Some(name) = entity_name {
+                let entity_type = mem
                     .tags
                     .iter()
-                    .find_map(|t| t.strip_prefix("entity:"))
-                    .map(|n| n.to_string());
+                    .find_map(|t| t.strip_prefix("entity_type:"))
+                    .unwrap_or("general")
+                    .to_lowercase();
 
-                if let Some(name) = entity_name {
-                    let entity_type = mem
-                        .tags
-                        .iter()
-                        .find_map(|t| t.strip_prefix("entity_type:"))
-                        .unwrap_or("general")
-                        .to_lowercase();
-
-                    let context: String = mem.content.chars().take(200).collect();
-                    categories
-                        .entry(entity_type)
-                        .or_default()
-                        .push((name, context));
-                }
+                let context: String = mem.content.chars().take(200).collect();
+                categories
+                    .entry(entity_type)
+                    .or_default()
+                    .push((name, context));
             }
         }
 
@@ -2213,12 +2167,9 @@ impl MenteDb {
 
         // Check if a community summary already exists for this category
         let community_tag = format!("community:{}", category);
-        let page_ids: Vec<PageId> = self.page_map.read().values().copied().collect();
         let mut existing_id = None;
-        for pid in &page_ids {
-            if let Ok(mem) = self.storage.load_memory(*pid)
-                && mem.tags.iter().any(|t| t == &community_tag)
-            {
+        for mem in self.db.all_memories().unwrap_or_default() {
+            if mem.tags.iter().any(|t| t == &community_tag) {
                 // Update existing summary content
                 let mut updated = mem.clone();
                 updated.content = summary.to_string();
@@ -2227,7 +2178,7 @@ impl MenteDb {
                         .embed(summary)
                         .unwrap_or_else(|_| updated.embedding.clone());
                 }
-                self.storage.store_memory(&updated)?;
+                self.db.store_memory(&updated)?;
                 existing_id = Some(updated.id);
                 break;
             }
@@ -2286,10 +2237,10 @@ impl MenteDb {
 
     /// Get existing community summaries.
     pub fn community_summaries(&self) -> Vec<MemoryNode> {
-        let page_ids: Vec<PageId> = self.page_map.read().values().copied().collect();
-        page_ids
-            .iter()
-            .filter_map(|pid| self.storage.load_memory(*pid).ok())
+        self.db
+            .all_memories()
+            .unwrap_or_default()
+            .into_iter()
             .filter(|m| m.tags.iter().any(|t| t == "community_summary"))
             .collect()
     }
@@ -2298,29 +2249,26 @@ impl MenteDb {
     ///
     /// Returns high-confidence memories suitable for profile building.
     pub fn profile_facts(&self) -> Vec<String> {
-        let page_ids: Vec<PageId> = self.page_map.read().values().copied().collect();
         let mut facts = Vec::new();
 
-        for pid in &page_ids {
-            if let Ok(mem) = self.storage.load_memory(*pid) {
-                // Only semantic and procedural memories with decent confidence
-                if mem.confidence < 0.5 {
-                    continue;
-                }
-                match mem.memory_type {
-                    MemoryType::Semantic | MemoryType::Procedural => {
-                        // Skip community summaries and entity nodes
-                        if mem
-                            .tags
-                            .iter()
-                            .any(|t| t == "community_summary" || t.starts_with("entity:"))
-                        {
-                            continue;
-                        }
-                        facts.push(mem.content.chars().take(300).collect());
+        for mem in self.db.all_memories().unwrap_or_default() {
+            // Only semantic and procedural memories with decent confidence
+            if mem.confidence < 0.5 {
+                continue;
+            }
+            match mem.memory_type {
+                MemoryType::Semantic | MemoryType::Procedural => {
+                    // Skip community summaries and entity nodes
+                    if mem
+                        .tags
+                        .iter()
+                        .any(|t| t == "community_summary" || t.starts_with("entity:"))
+                    {
+                        continue;
                     }
-                    _ => {}
+                    facts.push(mem.content.chars().take(300).collect());
                 }
+                _ => {}
             }
         }
 
@@ -2335,11 +2283,8 @@ impl MenteDb {
     /// If one already exists, it's replaced entirely.
     pub fn store_user_profile(&self, profile: &str) -> MenteResult<MemoryId> {
         // Find existing profile
-        let page_ids: Vec<PageId> = self.page_map.read().values().copied().collect();
-        for pid in &page_ids {
-            if let Ok(mem) = self.storage.load_memory(*pid)
-                && mem.tags.iter().any(|t| t == "user_profile")
-            {
+        for mem in self.db.all_memories().unwrap_or_default() {
+            if mem.tags.iter().any(|t| t == "user_profile") {
                 // Update in place
                 let mut updated = mem.clone();
                 updated.content = profile.to_string();
@@ -2348,7 +2293,7 @@ impl MenteDb {
                         .embed(profile)
                         .unwrap_or_else(|_| updated.embedding.clone());
                 }
-                self.storage.store_memory(&updated)?;
+                self.db.store_memory(&updated)?;
                 return Ok(updated.id);
             }
         }
@@ -2380,14 +2325,10 @@ impl MenteDb {
 
     /// Get the current user profile, if one exists.
     pub fn user_profile(&self) -> Option<MemoryNode> {
-        let page_ids: Vec<PageId> = self.page_map.read().values().copied().collect();
-        for pid in &page_ids {
-            if let Ok(mem) = self.storage.load_memory(*pid)
-                && mem.tags.iter().any(|t| t == "user_profile")
-            {
-                return Some(mem);
-            }
-        }
-        None
+        self.db
+            .all_memories()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|m| m.tags.iter().any(|t| t == "user_profile"))
     }
 }

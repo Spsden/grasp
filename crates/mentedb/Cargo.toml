@@ -20,6 +20,7 @@ mentedb-context = { workspace = true }
 mentedb-embedding = { workspace = true }
 mentedb-cognitive = { workspace = true }
 mentedb-consolidation = { workspace = true }
+mentedb-sqlite = { workspace = true }
 mentedb-extraction = { workspace = true, optional = true }
 uuid = { workspace = true }
 tracing = { workspace = true }

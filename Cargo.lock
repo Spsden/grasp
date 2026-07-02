@@ -2270,6 +2270,7 @@ dependencies = [
  "mentedb-graph",
  "mentedb-index",
  "mentedb-query",
+ "mentedb-sqlite",
  "mentedb-storage",
  "parking_lot",
  "serde",

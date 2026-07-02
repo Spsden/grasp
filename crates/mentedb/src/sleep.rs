@@ -8,7 +8,6 @@ use fs2::FileExt;
 use mentedb_consolidation::archival::ArchivalDecision;
 use mentedb_consolidation::consolidation::{ConsolidationCandidate, ConsolidationEngine};
 use mentedb_core::types::{MemoryId, Timestamp};
-use mentedb_storage::PageId;
 use serde::{Deserialize, Serialize};
 
 use crate::{MemoryNode, MenteDb, MenteResult};
@@ -225,39 +224,31 @@ impl MenteDb {
     fn load_sleep_maintenance_memories(
         &self,
         max_memories: usize,
-    ) -> Vec<(MemoryId, PageId, MemoryNode)> {
+    ) -> Vec<(MemoryId, MemoryNode)> {
         if max_memories == 0 {
             return Vec::new();
         }
 
-        let mut entries: Vec<(MemoryId, PageId)> = self
-            .page_map
-            .read()
-            .iter()
-            .map(|(memory_id, page_id)| (*memory_id, *page_id))
+        let mut entries: Vec<(MemoryId, MemoryNode)> = self
+            .db
+            .all_memories()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|node| (node.id, node))
             .collect();
         entries.sort_by_key(|(memory_id, _)| *memory_id);
         entries.truncate(max_memories);
-
         entries
-            .into_iter()
-            .filter_map(|(memory_id, page_id)| {
-                self.storage
-                    .load_memory(page_id)
-                    .ok()
-                    .map(|node| (memory_id, page_id, node))
-            })
-            .collect()
     }
 
     fn apply_sleep_decay(
         &self,
-        loaded: &[(MemoryId, PageId, MemoryNode)],
+        loaded: &[(MemoryId, MemoryNode)],
         config: &SleepMaintenanceConfig,
         result: &mut SleepMaintenanceResult,
     ) -> MenteResult<()> {
         let now = current_timestamp_us();
-        for (memory_id, _page_id, node) in loaded {
+        for (memory_id, node) in loaded {
             let new_salience = self.decay.compute_decay(
                 node.salience,
                 node.created_at,
@@ -271,10 +262,9 @@ impl MenteDb {
 
             let mut updated = node.clone();
             updated.salience = new_salience;
-            let new_page_id = self.storage.store_memory(&updated)?;
-            self.page_map.write().insert(*memory_id, new_page_id);
-            self.index.remove_memory(*memory_id, node);
-            self.index.index_memory(&updated);
+            // The db upsert refreshes FTS5 (trigger) and vec0 automatically.
+            self.db.store_memory(&updated)?;
+            let _ = memory_id;
             result.decay_updated += 1;
         }
         Ok(())
@@ -282,11 +272,11 @@ impl MenteDb {
 
     fn evaluate_sleep_archival(
         &self,
-        loaded: &[(MemoryId, PageId, MemoryNode)],
+        loaded: &[(MemoryId, MemoryNode)],
         config: &SleepMaintenanceConfig,
         result: &mut SleepMaintenanceResult,
     ) -> MenteResult<()> {
-        let memories: Vec<MemoryNode> = loaded.iter().map(|(_, _, node)| node.clone()).collect();
+        let memories: Vec<MemoryNode> = loaded.iter().map(|(_, node)| node.clone()).collect();
         let decisions = self.evaluate_archival_batch(&memories);
         result.archival_evaluated = decisions.len();
 
@@ -316,7 +306,7 @@ impl MenteDb {
 
     fn run_sleep_consolidation(
         &self,
-        loaded: &[(MemoryId, PageId, MemoryNode)],
+        loaded: &[(MemoryId, MemoryNode)],
         config: &SleepMaintenanceConfig,
         result: &mut SleepMaintenanceResult,
     ) {
@@ -343,13 +333,13 @@ impl MenteDb {
 
     fn find_sleep_consolidation_candidates(
         &self,
-        loaded: &[(MemoryId, PageId, MemoryNode)],
+        loaded: &[(MemoryId, MemoryNode)],
         config: &SleepMaintenanceConfig,
     ) -> Vec<ConsolidationCandidate> {
         let now = current_timestamp_us();
         let eligible: Vec<MemoryNode> = loaded
             .iter()
-            .map(|(_, _, node)| node)
+            .map(|(_, node)| node)
             .filter(|node| ConsolidationEngine::should_consolidate(node, now))
             .cloned()
             .collect();
