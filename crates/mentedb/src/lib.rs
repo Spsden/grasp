@@ -71,6 +71,7 @@ use mentedb_graph::GraphManager;
 use mentedb_query::{Mql, QueryPlan};
 use mentedb_sqlite::Backend;
 use parking_lot::RwLock;
+use policies::memory_is_archived;
 use serde_json::json;
 use tracing::{debug, info, warn};
 
@@ -96,8 +97,8 @@ pub use mentedb_sqlite as sqlite;
 pub use mentedb_sqlite::{
     ClaimEntityLink, ClaimEvidence, ClaimRecord, ConversationEvent, ConversationRecord,
     EntityAlias, EntityRecord, EntityRelationship, ExtractionArtifacts, ExtractionRun,
-    MemoryEntityLink, MemoryLifecycleEvent, MemoryOperation, MemorySource, RelationshipEvidence,
-    RetrievalConfig, RetrievalTrace, RetrievalTraceHit,
+    MemoryEntityLink, MemoryLifecycleEvent, MemoryOperation, MemorySource, PolicyAction, PolicyRun,
+    RelationshipEvidence, RetrievalConfig, RetrievalTrace, RetrievalTraceHit,
 };
 
 /// Renderer-neutral graph projection DTOs for app clients.
@@ -105,6 +106,8 @@ pub mod entity_extraction;
 /// Validated extraction job boundary for derived claims and relationships.
 pub mod extraction_jobs;
 pub mod graph_projection;
+/// Policy executors for correction, forget, decay, and archival.
+pub mod policies;
 /// Unified process_turn orchestration.
 pub mod process_turn;
 /// Bounded sleep maintenance for app background workers.
@@ -121,6 +124,9 @@ pub use extraction_jobs::{ValidatedExtractionBatch, validate_extraction_batch};
 pub use graph_projection::{
     GraphProjection, GraphProjectionConfig, GraphProjectionEdge, GraphProjectionNode,
 };
+pub use policies::{
+    CorrectionRequest, ForgetMode, ForgetScope, PolicyAffected, PolicyPlan, PolicyReport,
+};
 pub use sleep::{
     SleepMaintenanceConfig, SleepMaintenanceIssue, SleepMaintenanceLease, SleepMaintenanceResult,
     SleepMaintenanceStage,
@@ -136,8 +142,8 @@ pub mod prelude {
     pub use mentedb_sqlite::{
         ClaimEntityLink, ClaimEvidence, ClaimRecord, ConversationEvent, ConversationRecord,
         EntityAlias, EntityRecord, EntityRelationship, ExtractionArtifacts, ExtractionRun,
-        MemoryEntityLink, MemoryLifecycleEvent, MemoryOperation, MemorySource,
-        RelationshipEvidence, RetrievalConfig, RetrievalTrace, RetrievalTraceHit,
+        MemoryEntityLink, MemoryLifecycleEvent, MemoryOperation, MemorySource, PolicyAction,
+        PolicyRun, RelationshipEvidence, RetrievalConfig, RetrievalTrace, RetrievalTraceHit,
     };
 
     pub use crate::MenteDb;
@@ -145,6 +151,9 @@ pub mod prelude {
         EntityExtractionConfig, ExtractedEntity as ExtractedMemoryEntity,
     };
     pub use crate::extraction_jobs::{ValidatedExtractionBatch, validate_extraction_batch};
+    pub use crate::policies::{
+        CorrectionRequest, ForgetMode, ForgetScope, PolicyAffected, PolicyPlan, PolicyReport,
+    };
 }
 
 use std::collections::HashMap;
@@ -831,7 +840,10 @@ impl MenteDb {
             .filter(|(id, _)| {
                 // Temporal validity: exclude memories not valid at `at`.
                 match self.db.get_memory(*id) {
-                    Ok(Some(node)) => node.is_valid_at(at),
+                    Ok(Some(node)) => {
+                        node.is_valid_at(at)
+                            && (!memory_is_archived(&node) || archived_requested(tags))
+                    }
                     _ => true,
                 }
             })
@@ -1009,6 +1021,7 @@ impl MenteDb {
         };
         if !memory_matches_tags(&memory, tags, tags_or)
             || !memory_matches_time_range(&memory, time_range)
+            || (memory_is_archived(&memory) && !archived_requested(tags))
         {
             return Ok(());
         }
@@ -1363,17 +1376,7 @@ impl MenteDb {
     /// drops it from the in-memory graph.
     pub fn forget(&self, id: MemoryId) -> MenteResult<()> {
         debug!("Forgetting memory {}", id);
-        let deleted = self.db.delete_memory(id)?;
-        self.graph.remove_memory(id);
-        if deleted {
-            self.emit_lifecycle_event(
-                id,
-                "forgotten",
-                Some("memory_deleted"),
-                Some("forget"),
-                json!({ "deleted": true }),
-            )?;
-        }
+        self.apply_forget_policy(ForgetScope::Memory(id), ForgetMode::Hard)?;
         Ok(())
     }
 
@@ -1696,45 +1699,14 @@ impl MenteDb {
     /// This is an expensive operation intended for periodic maintenance.
     /// For real-time use, prefer `apply_decay` on retrieved memories.
     pub fn apply_decay_global(&self) -> MenteResult<usize> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_micros() as u64;
-        let ids = self.db.all_memory_ids()?;
-
-        let mut updated = 0;
-        for id in ids {
-            if let Ok(Some(mut node)) = self.db.get_memory(id) {
-                let new_salience = self.decay.compute_decay(
-                    node.salience,
-                    node.created_at,
-                    node.accessed_at,
-                    node.access_count,
-                    now,
-                );
-                if (new_salience - node.salience).abs() > 0.001 {
-                    let previous_salience = node.salience;
-                    node.salience = new_salience;
-                    self.db.store_memory(&node)?;
-                    self.emit_lifecycle_event(
-                        id,
-                        "decayed",
-                        Some("salience_decay_applied"),
-                        Some("decay_global"),
-                        json!({
-                            "previous_salience": previous_salience,
-                            "new_salience": new_salience,
-                            "applied_at": now,
-                        }),
-                    )?;
-                    updated += 1;
-                }
-            }
+        let report = self.apply_decay_policy_global()?;
+        if !report.affected.memory_ids.is_empty() {
+            info!(
+                "Decay pass updated {} memories",
+                report.affected.memory_ids.len()
+            );
         }
-        if updated > 0 {
-            info!("Decay pass updated {} memories", updated);
-        }
-        Ok(updated)
+        Ok(report.affected.memory_ids.len())
     }
 
     // -----------------------------------------------------------------------
@@ -3036,6 +3008,10 @@ fn memory_matches_tags(node: &MemoryNode, tags: Option<&[&str]>, tags_or: bool) 
         tags.iter()
             .all(|tag| node.tags.iter().any(|memory_tag| memory_tag == tag))
     }
+}
+
+fn archived_requested(tags: Option<&[&str]>) -> bool {
+    tags.map(|tags| tags.contains(&"archived")).unwrap_or(false)
 }
 
 fn memory_matches_time_range(

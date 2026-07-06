@@ -11,6 +11,13 @@ fn make_memory(content: &str, embedding: Vec<f32>) -> MemoryNode {
     )
 }
 
+fn current_test_time() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as u64
+}
+
 #[test]
 fn test_store_and_recall_similar() {
     let dir = tempfile::tempdir().unwrap();
@@ -241,6 +248,217 @@ fn test_graph_claim_recall_uses_relationship_evidence() {
         .unwrap();
 
     assert_eq!(results.first().map(|(id, _)| *id), Some(source_id));
+
+    db.close().unwrap();
+}
+
+#[test]
+fn test_correction_policy_invalidates_old_derived_truth() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = MenteDb::open(dir.path()).unwrap();
+
+    let old_memory = make_memory("User lives in Sydney.", Vec::new());
+    let old_id = old_memory.id;
+    db.store(old_memory).unwrap();
+    let new_memory = make_memory("User lives in Melbourne.", Vec::new());
+    let new_id = new_memory.id;
+    db.store(new_memory).unwrap();
+
+    let user = EntityRecord::new("person", "User");
+    let user_id = user.entity_id.clone();
+    let sydney = EntityRecord::new("place", "Sydney");
+    let sydney_id = sydney.entity_id.clone();
+    let mut run = ExtractionRun::new("claim_extractor", "v1");
+    run.source_memory_id = Some(old_id);
+    run.status = "completed".to_string();
+
+    let mut claim = ClaimRecord::new("User lives in Sydney", "fact");
+    claim.subject_entity_id = Some(user_id.clone());
+    claim.predicate = Some("lives_in".to_string());
+    claim.object_entity_id = Some(sydney_id);
+    let claim_id = claim.claim_id.clone();
+    let evidence = ClaimEvidence::new(claim_id.clone(), old_id);
+
+    db.store_validated_extraction(ValidatedExtractionBatch {
+        run,
+        entities: vec![user, sydney],
+        entity_aliases: vec![EntityAlias {
+            entity_id: user_id.clone(),
+            alias: "user".to_string(),
+            source: Some("test".to_string()),
+            confidence: 1.0,
+        }],
+        memory_entities: Vec::new(),
+        claims: vec![claim],
+        claim_entities: vec![ClaimEntityLink {
+            claim_id: claim_id.clone(),
+            entity_id: user_id.clone(),
+            role: "subject".to_string(),
+            confidence: 1.0,
+        }],
+        claim_evidence: vec![evidence],
+        relationships: Vec::new(),
+        relationship_evidence: Vec::new(),
+    })
+    .unwrap();
+
+    let mut request = CorrectionRequest::new(new_id);
+    request.old_memory_id = Some(old_id);
+    request.reason = Some("user corrected location".to_string());
+    let report = db.apply_correction_policy(request).unwrap();
+    assert_eq!(report.affected.claim_ids, vec![claim_id.clone()]);
+
+    let claims = db.claims_for_entity(&user_id).unwrap();
+    assert_eq!(claims[0].status, "corrected");
+    assert!(
+        !db.get_memory(old_id)
+            .unwrap()
+            .is_valid_at(current_test_time())
+    );
+    assert!(
+        db.lifecycle_events_for_memory(old_id, 10)
+            .unwrap()
+            .iter()
+            .any(|event| event.event_type == "corrected")
+    );
+    assert_eq!(db.recent_policy_runs(10).unwrap().len(), 1);
+
+    db.close().unwrap();
+}
+
+#[test]
+fn test_forget_policy_hard_removes_derived_artifacts() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = MenteDb::open(dir.path()).unwrap();
+
+    let memory = make_memory("Synapse uses Flutter.", Vec::new());
+    let memory_id = memory.id;
+    db.store(memory).unwrap();
+    let project = EntityRecord::new("project", "Synapse");
+    let project_id = project.entity_id.clone();
+    let tech = EntityRecord::new("technology", "Flutter");
+    let tech_id = tech.entity_id.clone();
+    let mut run = ExtractionRun::new("claim_extractor", "v1");
+    run.source_memory_id = Some(memory_id);
+    run.status = "completed".to_string();
+    let claim = ClaimRecord::new("Synapse uses Flutter", "fact");
+    let claim_id = claim.claim_id.clone();
+    let evidence = ClaimEvidence::new(claim_id.clone(), memory_id);
+    let relationship = EntityRelationship::new(project_id.clone(), tech_id, "uses");
+    let relationship_id = relationship.relationship_id.clone();
+    let relationship_evidence = RelationshipEvidence::new(relationship_id.clone(), memory_id);
+
+    db.store_validated_extraction(ValidatedExtractionBatch {
+        run,
+        entities: vec![project, tech],
+        entity_aliases: Vec::new(),
+        memory_entities: Vec::new(),
+        claims: vec![claim],
+        claim_entities: vec![ClaimEntityLink {
+            claim_id: claim_id.clone(),
+            entity_id: project_id.clone(),
+            role: "subject".to_string(),
+            confidence: 1.0,
+        }],
+        claim_evidence: vec![evidence],
+        relationships: vec![relationship],
+        relationship_evidence: vec![relationship_evidence],
+    })
+    .unwrap();
+
+    let preview = db
+        .preview_forget_policy(ForgetScope::Memory(memory_id), ForgetMode::Hard)
+        .unwrap();
+    assert!(preview.affected.claim_ids.contains(&claim_id));
+    assert!(preview.affected.relationship_ids.contains(&relationship_id));
+
+    db.apply_forget_policy(ForgetScope::Memory(memory_id), ForgetMode::Hard)
+        .unwrap();
+    assert!(db.get_memory(memory_id).is_err());
+    assert!(db.claims_for_entity(&project_id).unwrap().is_empty());
+    assert!(
+        db.relationship_evidence(&relationship_id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        db.lifecycle_events_for_memory(memory_id, 10)
+            .unwrap()
+            .iter()
+            .any(|event| event.event_type == "forgotten")
+    );
+
+    db.close().unwrap();
+}
+
+#[test]
+fn test_archive_policy_hides_cold_memory_from_default_recall() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = MenteDb::open(dir.path()).unwrap();
+
+    let now = current_test_time();
+    let mut memory = make_memory("Old temporary implementation note", vec![1.0, 0.0]);
+    memory.created_at = now - 10 * 24 * 3600 * 1_000_000;
+    memory.accessed_at = memory.created_at;
+    memory.salience = 0.05;
+    let memory_id = memory.id;
+    db.store(memory).unwrap();
+
+    let report = db.apply_archive_policy_global().unwrap();
+    assert_eq!(report.affected.memory_ids, vec![memory_id]);
+
+    let results = db
+        .recall_hybrid_at(
+            &[1.0, 0.0],
+            Some("temporary implementation"),
+            5,
+            now,
+            None,
+            None,
+        )
+        .unwrap();
+    assert!(!results.iter().any(|(id, _)| *id == memory_id));
+
+    let archived_results = db
+        .recall_hybrid_at(
+            &[1.0, 0.0],
+            Some("temporary implementation"),
+            5,
+            now,
+            Some(&["archived"]),
+            None,
+        )
+        .unwrap();
+    assert!(archived_results.iter().any(|(id, _)| *id == memory_id));
+
+    db.close().unwrap();
+}
+
+#[test]
+fn test_decay_policy_updates_salience_and_records_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = MenteDb::open(dir.path()).unwrap();
+
+    let now = current_test_time();
+    let mut memory = make_memory("Old preference that should decay", vec![1.0, 0.0]);
+    memory.created_at = now - 14 * 24 * 3600 * 1_000_000;
+    memory.accessed_at = memory.created_at;
+    memory.salience = 1.0;
+    let memory_id = memory.id;
+    db.store(memory).unwrap();
+
+    let report = db.apply_decay_policy_global().unwrap();
+    assert_eq!(report.affected.memory_ids, vec![memory_id]);
+
+    let decayed = db.get_memory(memory_id).unwrap();
+    assert!(decayed.salience < 1.0);
+    assert!(
+        db.lifecycle_events_for_memory(memory_id, 10)
+            .unwrap()
+            .iter()
+            .any(|event| event.event_type == "decayed")
+    );
+    assert_eq!(db.recent_policy_runs(10).unwrap()[0].policy_name, "decay");
 
     db.close().unwrap();
 }

@@ -145,6 +145,73 @@ impl MemoryLifecycleEvent {
     }
 }
 
+/// One policy execution run.
+#[derive(Debug, Clone)]
+pub struct PolicyRun {
+    pub run_id: String,
+    pub policy_name: String,
+    pub policy_version: String,
+    pub mode: String,
+    pub status: String,
+    pub scope_json: String,
+    pub result_json: String,
+    pub started_at: Timestamp,
+    pub completed_at: Option<Timestamp>,
+}
+
+impl PolicyRun {
+    /// Create a policy run with a generated id.
+    pub fn new(policy_name: impl Into<String>, mode: impl Into<String>) -> Self {
+        Self {
+            run_id: Uuid::new_v4().to_string(),
+            policy_name: policy_name.into(),
+            policy_version: "v1".to_string(),
+            mode: mode.into(),
+            status: "planned".to_string(),
+            scope_json: "{}".to_string(),
+            result_json: "{}".to_string(),
+            started_at: now_us(),
+            completed_at: None,
+        }
+    }
+}
+
+/// One durable action created by a policy run.
+#[derive(Debug, Clone)]
+pub struct PolicyAction {
+    pub action_id: String,
+    pub run_id: String,
+    pub action_type: String,
+    pub target_type: String,
+    pub target_id: Option<String>,
+    pub before_json: String,
+    pub after_json: String,
+    pub status: String,
+    pub created_at: Timestamp,
+}
+
+impl PolicyAction {
+    /// Create a policy action with a generated id.
+    pub fn new(
+        run_id: impl Into<String>,
+        action_type: impl Into<String>,
+        target_type: impl Into<String>,
+        target_id: Option<String>,
+    ) -> Self {
+        Self {
+            action_id: Uuid::new_v4().to_string(),
+            run_id: run_id.into(),
+            action_type: action_type.into(),
+            target_type: target_type.into(),
+            target_id,
+            before_json: "{}".to_string(),
+            after_json: "{}".to_string(),
+            status: "planned".to_string(),
+            created_at: now_us(),
+        }
+    }
+}
+
 /// Provenance for why a memory exists.
 #[derive(Debug, Clone)]
 pub struct MemorySource {
@@ -484,6 +551,39 @@ pub struct ExtractionArtifacts<'a> {
     pub claim_evidence: &'a [ClaimEvidence],
     pub relationships: &'a [EntityRelationship],
     pub relationship_evidence: &'a [RelationshipEvidence],
+}
+
+/// Transactional correction mutation built by the facade policy layer.
+pub struct CorrectionPolicyMutation<'a> {
+    pub run: &'a PolicyRun,
+    pub actions: &'a [PolicyAction],
+    pub memory_invalidations: &'a [(MemoryId, Timestamp)],
+    pub corrected_claim_ids: &'a [String],
+    pub corrected_relationship_ids: &'a [String],
+    pub edges: &'a [MemoryEdge],
+    pub lifecycle_events: &'a [MemoryLifecycleEvent],
+    pub applied_at: Timestamp,
+}
+
+/// Transactional forget mutation built by the facade policy layer.
+pub struct ForgetPolicyMutation<'a> {
+    pub run: &'a PolicyRun,
+    pub actions: &'a [PolicyAction],
+    pub memory_ids: &'a [MemoryId],
+    pub claim_ids: &'a [String],
+    pub relationship_ids: &'a [String],
+    pub entity_ids: &'a [String],
+    pub lifecycle_events: &'a [MemoryLifecycleEvent],
+    pub hard_delete: bool,
+    pub applied_at: Timestamp,
+}
+
+/// Generic lifecycle maintenance mutation for decay and archival.
+pub struct LifecyclePolicyMutation<'a> {
+    pub run: &'a PolicyRun,
+    pub actions: &'a [PolicyAction],
+    pub memory_updates: &'a [MemoryNode],
+    pub lifecycle_events: &'a [MemoryLifecycleEvent],
 }
 
 /// Map any error into `MenteError::Storage` with a human-readable message.
@@ -973,6 +1073,39 @@ impl Backend {
             CREATE INDEX IF NOT EXISTS idx_memory_lifecycle_type
                 ON memory_lifecycle_events(event_type, created_at DESC);
 
+            CREATE TABLE IF NOT EXISTS policy_runs (
+                run_id         TEXT PRIMARY KEY,
+                policy_name    TEXT NOT NULL,
+                policy_version TEXT NOT NULL,
+                mode           TEXT NOT NULL,
+                status         TEXT NOT NULL,
+                scope_json     TEXT NOT NULL DEFAULT '{}',
+                result_json    TEXT NOT NULL DEFAULT '{}',
+                started_at     INTEGER NOT NULL,
+                completed_at   INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_policy_runs_policy
+                ON policy_runs(policy_name, started_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_policy_runs_status
+                ON policy_runs(status, started_at DESC);
+
+            CREATE TABLE IF NOT EXISTS policy_actions (
+                action_id   TEXT PRIMARY KEY,
+                run_id      TEXT NOT NULL,
+                action_type TEXT NOT NULL,
+                target_type TEXT NOT NULL,
+                target_id   TEXT,
+                before_json TEXT NOT NULL DEFAULT '{}',
+                after_json  TEXT NOT NULL DEFAULT '{}',
+                status      TEXT NOT NULL,
+                created_at  INTEGER NOT NULL,
+                FOREIGN KEY(run_id) REFERENCES policy_runs(run_id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_policy_actions_run
+                ON policy_actions(run_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_policy_actions_target
+                ON policy_actions(target_type, target_id);
+
             CREATE TABLE IF NOT EXISTS memory_sources (
                 source_id       TEXT PRIMARY KEY,
                 memory_id       TEXT NOT NULL,
@@ -1382,6 +1515,133 @@ impl Backend {
                 "policy": event.policy.as_deref(),
             }),
         )?;
+        Ok(())
+    }
+
+    fn validate_json_object(value: &str, field: &str) -> Result<(), MenteError> {
+        let parsed: serde_json::Value = serde_json::from_str(value).map_err(|err| {
+            MenteError::InvalidInput(format!("{field} must be valid JSON: {err}"))
+        })?;
+        if !parsed.is_object() {
+            return Err(MenteError::InvalidInput(format!(
+                "{field} must be a JSON object"
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_policy_run(run: &PolicyRun) -> Result<(), MenteError> {
+        if run.run_id.trim().is_empty()
+            || run.policy_name.trim().is_empty()
+            || run.policy_version.trim().is_empty()
+            || run.mode.trim().is_empty()
+            || run.status.trim().is_empty()
+        {
+            return Err(MenteError::InvalidInput(
+                "policy run identity fields cannot be empty".to_string(),
+            ));
+        }
+        Self::validate_json_object(&run.scope_json, "policy run scope_json")?;
+        Self::validate_json_object(&run.result_json, "policy run result_json")
+    }
+
+    fn validate_policy_action(action: &PolicyAction) -> Result<(), MenteError> {
+        if action.action_id.trim().is_empty()
+            || action.run_id.trim().is_empty()
+            || action.action_type.trim().is_empty()
+            || action.target_type.trim().is_empty()
+            || action.status.trim().is_empty()
+        {
+            return Err(MenteError::InvalidInput(
+                "policy action identity fields cannot be empty".to_string(),
+            ));
+        }
+        Self::validate_json_object(&action.before_json, "policy action before_json")?;
+        Self::validate_json_object(&action.after_json, "policy action after_json")
+    }
+
+    fn upsert_policy_run_on(
+        tx: &rusqlite::Transaction<'_>,
+        run: &PolicyRun,
+    ) -> Result<(), MenteError> {
+        Self::validate_policy_run(run)?;
+        tx.execute(
+            r#"
+            INSERT INTO policy_runs (
+                run_id, policy_name, policy_version, mode, status,
+                scope_json, result_json, started_at, completed_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            ON CONFLICT(run_id) DO UPDATE SET
+                policy_name    = excluded.policy_name,
+                policy_version = excluded.policy_version,
+                mode           = excluded.mode,
+                status         = excluded.status,
+                scope_json     = excluded.scope_json,
+                result_json    = excluded.result_json,
+                completed_at   = excluded.completed_at
+            "#,
+            params![
+                run.run_id,
+                run.policy_name,
+                run.policy_version,
+                run.mode,
+                run.status,
+                run.scope_json,
+                run.result_json,
+                run.started_at as i64,
+                run.completed_at.map(|t| t as i64),
+            ],
+        )
+        .map_err(store_err)?;
+        Self::record_operation_on(
+            tx,
+            "policy_run_upsert",
+            None,
+            None,
+            None,
+            json!({
+                "run_id": run.run_id,
+                "policy_name": run.policy_name,
+                "policy_version": run.policy_version,
+                "mode": run.mode,
+                "status": run.status,
+            }),
+        )?;
+        Ok(())
+    }
+
+    fn insert_policy_action_on(
+        tx: &rusqlite::Transaction<'_>,
+        action: &PolicyAction,
+    ) -> Result<(), MenteError> {
+        Self::validate_policy_action(action)?;
+        tx.execute(
+            r#"
+            INSERT INTO policy_actions (
+                action_id, run_id, action_type, target_type, target_id,
+                before_json, after_json, status, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            ON CONFLICT(action_id) DO UPDATE SET
+                action_type = excluded.action_type,
+                target_type = excluded.target_type,
+                target_id   = excluded.target_id,
+                before_json = excluded.before_json,
+                after_json  = excluded.after_json,
+                status      = excluded.status
+            "#,
+            params![
+                action.action_id,
+                action.run_id,
+                action.action_type,
+                action.target_type,
+                action.target_id.as_deref(),
+                action.before_json,
+                action.after_json,
+                action.status,
+                action.created_at as i64,
+            ],
+        )
+        .map_err(store_err)?;
         Ok(())
     }
 
@@ -2944,6 +3204,101 @@ impl Backend {
         Ok(out)
     }
 
+    /// Relationships with evidence in a memory, newest first.
+    pub fn relationships_for_memory(
+        &self,
+        memory_id: MemoryId,
+    ) -> Result<Vec<EntityRelationship>, MenteError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT DISTINCT r.relationship_id, r.source_entity_id, r.target_entity_id,
+                       r.relation_type, r.confidence, r.status, r.valid_from, r.valid_until,
+                       r.attributes_json, r.source_run_id, r.created_at, r.updated_at
+                FROM entity_relationships r
+                JOIN relationship_evidence ev ON ev.relationship_id = r.relationship_id
+                WHERE ev.memory_id = ?1
+                ORDER BY r.updated_at DESC
+                "#,
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![memory_id.to_string()], |row| {
+                Ok(EntityRelationship {
+                    relationship_id: row.get(0)?,
+                    source_entity_id: row.get(1)?,
+                    target_entity_id: row.get(2)?,
+                    relation_type: row.get(3)?,
+                    confidence: row.get::<_, f64>(4)? as f32,
+                    status: row.get(5)?,
+                    valid_from: row.get::<_, Option<i64>>(6)?.map(|t| t as Timestamp),
+                    valid_until: row.get::<_, Option<i64>>(7)?.map(|t| t as Timestamp),
+                    attributes_json: row.get(8)?,
+                    source_run_id: row.get(9)?,
+                    created_at: row.get::<_, i64>(10)? as Timestamp,
+                    updated_at: row.get::<_, i64>(11)? as Timestamp,
+                })
+            })
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(store_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Memory ids associated with a conversation through sources or extraction runs.
+    pub fn memory_ids_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<MemoryId>, MenteError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT DISTINCT memory_id
+                FROM memory_sources
+                WHERE conversation_id = ?1
+                UNION
+                SELECT DISTINCT source_memory_id
+                FROM extraction_runs
+                WHERE conversation_id = ?1 AND source_memory_id IS NOT NULL
+                "#,
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![conversation_id], |row| {
+                Ok(parse_id::<MemoryId>(&row.get::<_, String>(0)?)
+                    .unwrap_or_else(|_| MemoryId::nil()))
+            })
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(store_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Memory ids carrying one exact tag.
+    pub fn memory_ids_for_tag(&self, tag: &str) -> Result<Vec<MemoryId>, MenteError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare("SELECT memory_id FROM memory_tags WHERE tag = ?1 ORDER BY memory_id")
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![tag], |row| {
+                Ok(parse_id::<MemoryId>(&row.get::<_, String>(0)?)
+                    .unwrap_or_else(|_| MemoryId::nil()))
+            })
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(store_err)?);
+        }
+        Ok(out)
+    }
+
     /// Persist one extraction run and all derived artifacts in one transaction.
     pub fn persist_extraction_artifacts(
         &self,
@@ -3058,11 +3413,7 @@ impl Backend {
         Ok(Some(node))
     }
 
-    /// Delete a memory, its vector row, and its tags. Returns `true` if a row
-    /// was removed.
-    pub fn delete_memory(&self, id: MemoryId) -> Result<bool, MenteError> {
-        let mut conn = self.conn.lock();
-        let tx = conn.transaction().map_err(store_err)?;
+    fn delete_memory_on(tx: &rusqlite::Transaction<'_>, id: MemoryId) -> Result<bool, MenteError> {
         let id_str = id.to_string();
         let rowid: Option<i64> = tx
             .query_row(
@@ -3091,7 +3442,7 @@ impl Backend {
         tx.execute("DELETE FROM memories WHERE id = ?1", params![id_str])
             .map_err(store_err)?;
         Self::record_operation_on(
-            &tx,
+            tx,
             "memory_delete",
             Some(id),
             None,
@@ -3102,8 +3453,107 @@ impl Backend {
                 "deleted_edges": edge_count,
             }),
         )?;
-        tx.commit().map_err(store_err)?;
         Ok(true)
+    }
+
+    /// Delete a memory, its vector row, and its tags. Returns `true` if a row
+    /// was removed.
+    pub fn delete_memory(&self, id: MemoryId) -> Result<bool, MenteError> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(store_err)?;
+        let deleted = Self::delete_memory_on(&tx, id)?;
+        tx.commit().map_err(store_err)?;
+        Ok(deleted)
+    }
+
+    fn invalidate_memory_on(
+        tx: &rusqlite::Transaction<'_>,
+        id: MemoryId,
+        valid_until: Timestamp,
+    ) -> Result<bool, MenteError> {
+        let changed = tx
+            .execute(
+                "UPDATE memories SET valid_until = ?2 WHERE id = ?1",
+                params![id.to_string(), valid_until as i64],
+            )
+            .map_err(store_err)?;
+        if changed > 0 {
+            Self::record_operation_on(
+                tx,
+                "memory_invalidate",
+                Some(id),
+                None,
+                None,
+                json!({ "valid_until": valid_until }),
+            )?;
+        }
+        Ok(changed > 0)
+    }
+
+    fn mark_claim_status_on(
+        tx: &rusqlite::Transaction<'_>,
+        claim_id: &str,
+        status: &str,
+        valid_until: Timestamp,
+    ) -> Result<bool, MenteError> {
+        let changed = tx
+            .execute(
+                r#"
+                UPDATE claims
+                SET status = ?2, valid_until = ?3, updated_at = ?3
+                WHERE claim_id = ?1
+                "#,
+                params![claim_id, status, valid_until as i64],
+            )
+            .map_err(store_err)?;
+        if changed > 0 {
+            Self::record_operation_on(
+                tx,
+                "claim_status_update",
+                None,
+                None,
+                None,
+                json!({
+                    "claim_id": claim_id,
+                    "status": status,
+                    "valid_until": valid_until,
+                }),
+            )?;
+        }
+        Ok(changed > 0)
+    }
+
+    fn mark_relationship_status_on(
+        tx: &rusqlite::Transaction<'_>,
+        relationship_id: &str,
+        status: &str,
+        valid_until: Timestamp,
+    ) -> Result<bool, MenteError> {
+        let changed = tx
+            .execute(
+                r#"
+                UPDATE entity_relationships
+                SET status = ?2, valid_until = ?3, updated_at = ?3
+                WHERE relationship_id = ?1
+                "#,
+                params![relationship_id, status, valid_until as i64],
+            )
+            .map_err(store_err)?;
+        if changed > 0 {
+            Self::record_operation_on(
+                tx,
+                "relationship_status_update",
+                None,
+                None,
+                None,
+                json!({
+                    "relationship_id": relationship_id,
+                    "status": status,
+                    "valid_until": valid_until,
+                }),
+            )?;
+        }
+        Ok(changed > 0)
     }
 
     /// Total number of stored memories.
@@ -3169,11 +3619,7 @@ impl Backend {
     // Edges (knowledge graph), replaces the CSR/CSC graph engine.
     // -----------------------------------------------------------------------
 
-    /// Insert a typed, weighted, optionally temporally-bounded edge between two
-    /// memories. Duplicate edges are permitted (the original CSR did too).
-    pub fn add_edge(&self, edge: &MemoryEdge) -> Result<(), MenteError> {
-        let mut conn = self.conn.lock();
-        let tx = conn.transaction().map_err(store_err)?;
+    fn add_edge_on(tx: &rusqlite::Transaction<'_>, edge: &MemoryEdge) -> Result<(), MenteError> {
         tx.execute(
             r#"INSERT INTO edges
                  (source, target, edge_type, weight, created_at, valid_from, valid_until, label)
@@ -3191,7 +3637,7 @@ impl Backend {
         )
         .map_err(store_err)?;
         Self::record_operation_on(
-            &tx,
+            tx,
             "edge_insert",
             None,
             Some(edge.source),
@@ -3204,6 +3650,15 @@ impl Backend {
                 "label": edge.label.as_deref(),
             }),
         )?;
+        Ok(())
+    }
+
+    /// Insert a typed, weighted, optionally temporally-bounded edge between two
+    /// memories. Duplicate edges are permitted (the original CSR did too).
+    pub fn add_edge(&self, edge: &MemoryEdge) -> Result<(), MenteError> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(store_err)?;
+        Self::add_edge_on(&tx, edge)?;
         tx.commit().map_err(store_err)?;
         Ok(())
     }
@@ -3394,6 +3849,133 @@ impl Backend {
         Ok(())
     }
 
+    /// Apply a correction policy in one SQLite transaction.
+    pub fn apply_correction_policy(
+        &self,
+        mutation: CorrectionPolicyMutation<'_>,
+    ) -> Result<(), MenteError> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(store_err)?;
+        Self::upsert_policy_run_on(&tx, mutation.run)?;
+        for action in mutation.actions {
+            Self::insert_policy_action_on(&tx, action)?;
+        }
+        for (memory_id, valid_until) in mutation.memory_invalidations {
+            Self::invalidate_memory_on(&tx, *memory_id, *valid_until)?;
+        }
+        for claim_id in mutation.corrected_claim_ids {
+            Self::mark_claim_status_on(&tx, claim_id, "corrected", mutation.applied_at)?;
+        }
+        for relationship_id in mutation.corrected_relationship_ids {
+            Self::mark_relationship_status_on(
+                &tx,
+                relationship_id,
+                "corrected",
+                mutation.applied_at,
+            )?;
+        }
+        for edge in mutation.edges {
+            Self::add_edge_on(&tx, edge)?;
+        }
+        for event in mutation.lifecycle_events {
+            Self::insert_memory_lifecycle_event_on(&tx, event)?;
+        }
+        tx.commit().map_err(store_err)
+    }
+
+    /// Apply a forget policy in one SQLite transaction.
+    pub fn apply_forget_policy(
+        &self,
+        mutation: ForgetPolicyMutation<'_>,
+    ) -> Result<(), MenteError> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(store_err)?;
+        Self::upsert_policy_run_on(&tx, mutation.run)?;
+        for action in mutation.actions {
+            Self::insert_policy_action_on(&tx, action)?;
+        }
+        for event in mutation.lifecycle_events {
+            Self::insert_memory_lifecycle_event_on(&tx, event)?;
+        }
+
+        if mutation.hard_delete {
+            for relationship_id in mutation.relationship_ids {
+                tx.execute(
+                    "DELETE FROM entity_relationships WHERE relationship_id = ?1",
+                    params![relationship_id],
+                )
+                .map_err(store_err)?;
+            }
+            for claim_id in mutation.claim_ids {
+                tx.execute("DELETE FROM claims WHERE claim_id = ?1", params![claim_id])
+                    .map_err(store_err)?;
+            }
+            for memory_id in mutation.memory_ids {
+                Self::delete_memory_on(&tx, *memory_id)?;
+            }
+            for entity_id in mutation.entity_ids {
+                tx.execute(
+                    "DELETE FROM entities WHERE entity_id = ?1",
+                    params![entity_id],
+                )
+                .map_err(store_err)?;
+            }
+        } else {
+            for memory_id in mutation.memory_ids {
+                Self::invalidate_memory_on(&tx, *memory_id, mutation.applied_at)?;
+            }
+            for claim_id in mutation.claim_ids {
+                Self::mark_claim_status_on(&tx, claim_id, "forgotten", mutation.applied_at)?;
+            }
+            for relationship_id in mutation.relationship_ids {
+                Self::mark_relationship_status_on(
+                    &tx,
+                    relationship_id,
+                    "forgotten",
+                    mutation.applied_at,
+                )?;
+            }
+        }
+
+        Self::record_operation_on(
+            &tx,
+            "forget_policy_apply",
+            None,
+            None,
+            None,
+            json!({
+                "run_id": mutation.run.run_id,
+                "hard_delete": mutation.hard_delete,
+                "memory_count": mutation.memory_ids.len(),
+                "claim_count": mutation.claim_ids.len(),
+                "relationship_count": mutation.relationship_ids.len(),
+                "entity_count": mutation.entity_ids.len(),
+            }),
+        )?;
+        tx.commit().map_err(store_err)
+    }
+
+    /// Apply decay or archive maintenance updates in one SQLite transaction.
+    pub fn apply_lifecycle_policy(
+        &self,
+        mutation: LifecyclePolicyMutation<'_>,
+    ) -> Result<(), MenteError> {
+        let dim = self.embedding_dim.load(Ordering::Relaxed);
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(store_err)?;
+        Self::upsert_policy_run_on(&tx, mutation.run)?;
+        for action in mutation.actions {
+            Self::insert_policy_action_on(&tx, action)?;
+        }
+        for memory in mutation.memory_updates {
+            Self::store_memory_on(&tx, memory, dim)?;
+        }
+        for event in mutation.lifecycle_events {
+            Self::insert_memory_lifecycle_event_on(&tx, event)?;
+        }
+        tx.commit().map_err(store_err)
+    }
+
     // -----------------------------------------------------------------------
     // Bulk helpers, replace StorageEngine::scan_all_memories / store_memory_batch
     // -----------------------------------------------------------------------
@@ -3457,6 +4039,78 @@ impl Backend {
         let tx = conn.transaction().map_err(store_err)?;
         Self::insert_memory_lifecycle_event_on(&tx, event)?;
         tx.commit().map_err(store_err)
+    }
+
+    /// Recent policy runs, newest first.
+    pub fn recent_policy_runs(&self, limit: usize) -> Result<Vec<PolicyRun>, MenteError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT run_id, policy_name, policy_version, mode, status,
+                       scope_json, result_json, started_at, completed_at
+                FROM policy_runs
+                ORDER BY started_at DESC
+                LIMIT ?1
+                "#,
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![usize_to_i64(limit)?], |row| {
+                Ok(PolicyRun {
+                    run_id: row.get(0)?,
+                    policy_name: row.get(1)?,
+                    policy_version: row.get(2)?,
+                    mode: row.get(3)?,
+                    status: row.get(4)?,
+                    scope_json: row.get(5)?,
+                    result_json: row.get(6)?,
+                    started_at: row.get::<_, i64>(7)? as Timestamp,
+                    completed_at: row.get::<_, Option<i64>>(8)?.map(|t| t as Timestamp),
+                })
+            })
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(store_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Actions for one policy run in creation order.
+    pub fn policy_actions_for_run(&self, run_id: &str) -> Result<Vec<PolicyAction>, MenteError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT action_id, run_id, action_type, target_type, target_id,
+                       before_json, after_json, status, created_at
+                FROM policy_actions
+                WHERE run_id = ?1
+                ORDER BY created_at ASC
+                "#,
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![run_id], |row| {
+                Ok(PolicyAction {
+                    action_id: row.get(0)?,
+                    run_id: row.get(1)?,
+                    action_type: row.get(2)?,
+                    target_type: row.get(3)?,
+                    target_id: row.get(4)?,
+                    before_json: row.get(5)?,
+                    after_json: row.get(6)?,
+                    status: row.get(7)?,
+                    created_at: row.get::<_, i64>(8)? as Timestamp,
+                })
+            })
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(store_err)?);
+        }
+        Ok(out)
     }
 
     /// Lifecycle events for one memory, newest first.
