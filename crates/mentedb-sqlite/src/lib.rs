@@ -8,6 +8,7 @@
 //! * `memory_vec` stores a rebuildable sqlite-vec projection.
 //! * `edges` stores graph relationships as durable rows.
 //! * `memory_operations` stores the write audit trail.
+//! * `memory_lifecycle_events` stores policy and correction audit events.
 //! * `retrieval_traces` and `retrieval_trace_hits` store optional recall traces.
 //! * `schema_meta` stores schema version and projection metadata.
 //!
@@ -32,7 +33,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::json;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: usize = 3;
+const SCHEMA_VERSION: usize = 4;
 
 /// Tunable retrieval parameters.
 ///
@@ -115,6 +116,33 @@ pub struct MemoryOperation {
     pub target: Option<MemoryId>,
     pub payload_json: String,
     pub created_at: Timestamp,
+}
+
+/// Durable lifecycle audit event for a memory.
+#[derive(Debug, Clone)]
+pub struct MemoryLifecycleEvent {
+    pub event_id: String,
+    pub memory_id: MemoryId,
+    pub event_type: String,
+    pub reason: Option<String>,
+    pub policy: Option<String>,
+    pub payload_json: String,
+    pub created_at: Timestamp,
+}
+
+impl MemoryLifecycleEvent {
+    /// Create a lifecycle event with a generated event id.
+    pub fn new(memory_id: MemoryId, event_type: impl Into<String>) -> Self {
+        Self {
+            event_id: Uuid::new_v4().to_string(),
+            memory_id,
+            event_type: event_type.into(),
+            reason: None,
+            policy: None,
+            payload_json: "{}".to_string(),
+            created_at: now_us(),
+        }
+    }
 }
 
 /// Provenance for why a memory exists.
@@ -918,6 +946,20 @@ impl Backend {
             CREATE INDEX IF NOT EXISTS idx_memory_operations_edge
                 ON memory_operations(source, target, created_at DESC);
 
+            CREATE TABLE IF NOT EXISTS memory_lifecycle_events (
+                event_id     TEXT PRIMARY KEY,
+                memory_id    TEXT NOT NULL,
+                event_type   TEXT NOT NULL,
+                reason       TEXT,
+                policy       TEXT,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at   INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_lifecycle_memory
+                ON memory_lifecycle_events(memory_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_memory_lifecycle_type
+                ON memory_lifecycle_events(event_type, created_at DESC);
+
             CREATE TABLE IF NOT EXISTS memory_sources (
                 source_id       TEXT PRIMARY KEY,
                 memory_id       TEXT NOT NULL,
@@ -1263,6 +1305,70 @@ impl Backend {
             ],
         )
         .map_err(store_err)?;
+        Ok(())
+    }
+
+    fn validate_lifecycle_event(event: &MemoryLifecycleEvent) -> Result<(), MenteError> {
+        if event.event_id.trim().is_empty() {
+            return Err(MenteError::InvalidInput(
+                "lifecycle event_id cannot be empty".to_string(),
+            ));
+        }
+        if event.event_type.trim().is_empty() {
+            return Err(MenteError::InvalidInput(
+                "lifecycle event_type cannot be empty".to_string(),
+            ));
+        }
+        let payload: serde_json::Value =
+            serde_json::from_str(&event.payload_json).map_err(|err| {
+                MenteError::InvalidInput(format!(
+                    "lifecycle payload_json must be valid JSON: {err}"
+                ))
+            })?;
+        if !payload.is_object() {
+            return Err(MenteError::InvalidInput(
+                "lifecycle payload_json must be a JSON object".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn insert_memory_lifecycle_event_on(
+        tx: &rusqlite::Transaction<'_>,
+        event: &MemoryLifecycleEvent,
+    ) -> Result<(), MenteError> {
+        Self::validate_lifecycle_event(event)?;
+        tx.execute(
+            r#"
+            INSERT INTO memory_lifecycle_events (
+                event_id, memory_id, event_type, reason, policy,
+                payload_json, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "#,
+            params![
+                event.event_id.as_str(),
+                event.memory_id.to_string(),
+                event.event_type.as_str(),
+                event.reason.as_deref(),
+                event.policy.as_deref(),
+                event.payload_json.as_str(),
+                event.created_at as i64,
+            ],
+        )
+        .map_err(store_err)?;
+        Self::record_operation_on(
+            tx,
+            "memory_lifecycle_event_record",
+            Some(event.memory_id),
+            None,
+            None,
+            json!({
+                "event_id": event.event_id.as_str(),
+                "event_type": event.event_type.as_str(),
+                "reason": event.reason.as_deref(),
+                "policy": event.policy.as_deref(),
+            }),
+        )?;
         Ok(())
     }
 
@@ -3325,6 +3431,89 @@ impl Backend {
         tx.commit().map_err(store_err)
     }
 
+    /// Append one memory lifecycle event and its audit operation.
+    pub fn record_lifecycle_event(&self, event: &MemoryLifecycleEvent) -> Result<(), MenteError> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(store_err)?;
+        Self::insert_memory_lifecycle_event_on(&tx, event)?;
+        tx.commit().map_err(store_err)
+    }
+
+    /// Lifecycle events for one memory, newest first.
+    pub fn lifecycle_events_for_memory(
+        &self,
+        id: MemoryId,
+        limit: usize,
+    ) -> Result<Vec<MemoryLifecycleEvent>, MenteError> {
+        let memory_id = id.to_string();
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT event_id, memory_id, event_type, reason, policy,
+                       payload_json, created_at
+                FROM memory_lifecycle_events
+                WHERE memory_id = ?1
+                ORDER BY created_at DESC
+                LIMIT ?2
+                "#,
+            )
+            .map_err(store_err)?;
+        let mut rows = stmt
+            .query(params![memory_id, usize_to_i64(limit)?])
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().map_err(store_err)? {
+            let raw_memory_id: String = row.get(1).map_err(store_err)?;
+            out.push(MemoryLifecycleEvent {
+                event_id: row.get(0).map_err(store_err)?,
+                memory_id: parse_id(&raw_memory_id)?,
+                event_type: row.get(2).map_err(store_err)?,
+                reason: row.get(3).map_err(store_err)?,
+                policy: row.get(4).map_err(store_err)?,
+                payload_json: row.get(5).map_err(store_err)?,
+                created_at: row.get::<_, i64>(6).map_err(store_err)? as Timestamp,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Recent lifecycle events across the store, newest first.
+    pub fn recent_lifecycle_events(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<MemoryLifecycleEvent>, MenteError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT event_id, memory_id, event_type, reason, policy,
+                       payload_json, created_at
+                FROM memory_lifecycle_events
+                ORDER BY created_at DESC
+                LIMIT ?1
+                "#,
+            )
+            .map_err(store_err)?;
+        let mut rows = stmt
+            .query(params![usize_to_i64(limit)?])
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().map_err(store_err)? {
+            let raw_memory_id: String = row.get(1).map_err(store_err)?;
+            out.push(MemoryLifecycleEvent {
+                event_id: row.get(0).map_err(store_err)?,
+                memory_id: parse_id(&raw_memory_id)?,
+                event_type: row.get(2).map_err(store_err)?,
+                reason: row.get(3).map_err(store_err)?,
+                policy: row.get(4).map_err(store_err)?,
+                payload_json: row.get(5).map_err(store_err)?,
+                created_at: row.get::<_, i64>(6).map_err(store_err)? as Timestamp,
+            });
+        }
+        Ok(out)
+    }
+
     /// Recent write-side audit rows, newest first.
     pub fn recent_operations(&self, limit: usize) -> Result<Vec<MemoryOperation>, MenteError> {
         let conn = self.conn.lock();
@@ -4323,6 +4512,49 @@ mod tests {
 
         let b_ops = db.operations_for_memory(b, 10).unwrap();
         assert!(b_ops.iter().any(|op| op.operation_type == "edge_insert"));
+    }
+
+    #[test]
+    fn lifecycle_events_roundtrip_and_record_operations() {
+        let db = Backend::open_in_memory(2).unwrap();
+        let id = MemoryId::new();
+        db.store_memory(&make_node(id, "alpha", vec![1.0, 0.0]))
+            .unwrap();
+
+        let mut event = MemoryLifecycleEvent::new(id, "corrected");
+        event.reason = Some("user correction".to_string());
+        event.policy = Some("manual-review".to_string());
+        event.payload_json = json!({"superseded_by": "new-memory-id"}).to_string();
+        let event_id = event.event_id.clone();
+
+        db.record_lifecycle_event(&event).unwrap();
+
+        let by_memory = db.lifecycle_events_for_memory(id, 10).unwrap();
+        assert_eq!(by_memory.len(), 1);
+        assert_eq!(by_memory[0].event_id, event_id);
+        assert_eq!(by_memory[0].event_type, "corrected");
+        assert_eq!(by_memory[0].reason.as_deref(), Some("user correction"));
+
+        let recent = db.recent_lifecycle_events(10).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].event_id, event_id);
+
+        let operations = db.operations_for_memory(id, 10).unwrap();
+        assert!(
+            operations
+                .iter()
+                .any(|op| op.operation_type == "memory_lifecycle_event_record")
+        );
+    }
+
+    #[test]
+    fn lifecycle_events_reject_invalid_payloads() {
+        let db = Backend::open_in_memory(2).unwrap();
+        let mut event = MemoryLifecycleEvent::new(MemoryId::new(), "decayed");
+        event.payload_json = "[]".to_string();
+
+        let err = db.record_lifecycle_event(&event).unwrap_err();
+        assert!(matches!(err, MenteError::InvalidInput(_)));
     }
 
     #[test]

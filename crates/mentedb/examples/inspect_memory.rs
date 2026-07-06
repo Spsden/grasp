@@ -12,8 +12,8 @@ use std::str::FromStr;
 use mentedb::core::types::MemoryId;
 use mentedb::prelude::*;
 use mentedb::{
-    ClaimRecord, EntityRecord, EntityRelationship, MemoryEntityLink, MemoryOperation, MemorySource,
-    MenteDb, RetrievalTrace, RetrievalTraceHit,
+    ClaimRecord, EntityRecord, EntityRelationship, MemoryEntityLink, MemoryLifecycleEvent,
+    MemoryOperation, MemorySource, MenteDb, RetrievalTrace, RetrievalTraceHit,
 };
 
 const DEFAULT_DB_DIR: &str = "./grasp-data";
@@ -205,6 +205,7 @@ fn print_summary(db: &MenteDb, db_dir: &PathBuf, limit: usize) -> MenteResult<()
     let traces = db.recent_retrieval_traces(limit)?;
     let operations = db.recent_memory_operations(limit)?;
     let extraction_runs = db.recent_extraction_runs(limit)?;
+    let lifecycle_events = db.recent_lifecycle_events(limit)?;
 
     println!("store: {}", db_dir.display());
     println!("memories: {}", db.memory_count());
@@ -213,6 +214,7 @@ fn print_summary(db: &MenteDb, db_dir: &PathBuf, limit: usize) -> MenteResult<()
     println!("retrieval_traces_sampled: {}", traces.len());
     println!("operations_sampled: {}", operations.len());
     println!("extraction_runs_sampled: {}", extraction_runs.len());
+    println!("lifecycle_events_sampled: {}", lifecycle_events.len());
     Ok(())
 }
 
@@ -364,6 +366,9 @@ fn print_memory(db: &MenteDb, id: MemoryId) -> MenteResult<()> {
     for claim in db.claims_for_memory(id)? {
         print_claim("  claim", &claim);
     }
+    for event in db.lifecycle_events_for_memory(id, 20)? {
+        print_lifecycle_event("  lifecycle", &event);
+    }
     for op in db.memory_operations_for(id, 20)? {
         print_operation_with_prefix("  op", &op);
     }
@@ -440,6 +445,20 @@ fn print_source(prefix: &str, source: &MemorySource) {
         source.extractor.as_deref().unwrap_or(""),
         source.created_at,
         compact(&source.payload_json, 160)
+    );
+}
+
+fn print_lifecycle_event(prefix: &str, event: &MemoryLifecycleEvent) {
+    println!(
+        "{} {} memory={} type={} reason={} policy={} created_at={} payload={}",
+        prefix,
+        event.event_id,
+        event.memory_id,
+        event.event_type,
+        event.reason.as_deref().unwrap_or(""),
+        event.policy.as_deref().unwrap_or(""),
+        event.created_at,
+        compact(&event.payload_json, 160)
     );
 }
 

@@ -182,6 +182,7 @@ Current operation types:
 - `edge_delete_for_memory`
 - `vector_index_rebuild`
 - `memory_source_upsert`
+- `memory_lifecycle_event_record`
 - `conversation_upsert`
 - `conversation_event_upsert`
 - `extraction_run_upsert`
@@ -193,6 +194,35 @@ Current operation types:
 - `claim_evidence_upsert`
 - `entity_relationship_upsert`
 - `relationship_evidence_upsert`
+
+### `memory_lifecycle_events`
+
+Append-only lifecycle audit table for policy and correction events. These rows
+intentionally do not use a foreign key to `memories`, so a delete or forget
+operation can still leave an inspectable tombstone by memory id. Keep payloads
+metadata-focused and avoid copying private raw content into lifecycle rows.
+
+```sql
+CREATE TABLE memory_lifecycle_events (
+    event_id     TEXT PRIMARY KEY,
+    memory_id    TEXT NOT NULL,
+    event_type   TEXT NOT NULL,
+    reason       TEXT,
+    policy       TEXT,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at   INTEGER NOT NULL
+);
+
+CREATE INDEX idx_memory_lifecycle_memory
+    ON memory_lifecycle_events(memory_id, created_at DESC);
+CREATE INDEX idx_memory_lifecycle_type
+    ON memory_lifecycle_events(event_type, created_at DESC);
+```
+
+Expected event types are strings, not an enum, so product policy can evolve
+without schema churn. Useful values include `corrected`, `deduplicated`,
+`decayed`, `archived`, `invalidated`, `forgotten`, `consolidated`, and
+`feedback`.
 
 ### `memory_sources`
 
@@ -617,6 +647,15 @@ FROM memory_operations
 WHERE memory_id = ?
    OR source = ?
    OR target = ?
+ORDER BY created_at DESC;
+```
+
+Lifecycle for one memory:
+
+```sql
+SELECT event_type, reason, policy, payload_json, created_at
+FROM memory_lifecycle_events
+WHERE memory_id = ?
 ORDER BY created_at DESC;
 ```
 

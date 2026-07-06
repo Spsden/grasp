@@ -97,8 +97,8 @@ pub use mentedb_sqlite as sqlite;
 pub use mentedb_sqlite::{
     ClaimEntityLink, ClaimEvidence, ClaimRecord, ConversationEvent, ConversationRecord,
     EntityAlias, EntityRecord, EntityRelationship, ExtractionRun, MemoryEntityLink,
-    MemoryOperation, MemorySource, RelationshipEvidence, RetrievalConfig, RetrievalTrace,
-    RetrievalTraceHit,
+    MemoryLifecycleEvent, MemoryOperation, MemorySource, RelationshipEvidence, RetrievalConfig,
+    RetrievalTrace, RetrievalTraceHit,
 };
 
 /// Renderer-neutral graph projection DTOs for app clients.
@@ -135,8 +135,8 @@ pub mod prelude {
     pub use mentedb_sqlite::{
         ClaimEntityLink, ClaimEvidence, ClaimRecord, ConversationEvent, ConversationRecord,
         EntityAlias, EntityRecord, EntityRelationship, ExtractionRun, MemoryEntityLink,
-        MemoryOperation, MemorySource, RelationshipEvidence, RetrievalConfig, RetrievalTrace,
-        RetrievalTraceHit,
+        MemoryLifecycleEvent, MemoryOperation, MemorySource, RelationshipEvidence, RetrievalConfig,
+        RetrievalTrace, RetrievalTraceHit,
     };
 
     pub use crate::MenteDb;
@@ -1181,6 +1181,25 @@ impl MenteDb {
         limit: usize,
     ) -> MenteResult<Vec<MemoryOperation>> {
         self.db.operations_for_memory(id, limit)
+    }
+
+    /// Append one durable lifecycle audit event for a memory.
+    pub fn record_lifecycle_event(&self, event: MemoryLifecycleEvent) -> MenteResult<()> {
+        self.db.record_lifecycle_event(&event)
+    }
+
+    /// Lifecycle events for one memory, newest first.
+    pub fn lifecycle_events_for_memory(
+        &self,
+        id: MemoryId,
+        limit: usize,
+    ) -> MenteResult<Vec<MemoryLifecycleEvent>> {
+        self.db.lifecycle_events_for_memory(id, limit)
+    }
+
+    /// Recent lifecycle events across the store, newest first.
+    pub fn recent_lifecycle_events(&self, limit: usize) -> MenteResult<Vec<MemoryLifecycleEvent>> {
+        self.db.recent_lifecycle_events(limit)
     }
 
     /// Recent retrieval trace headers, newest first.
@@ -2273,7 +2292,7 @@ impl MenteDb {
             .unwrap_or_default()
             .as_micros() as u64;
 
-        // Build a map: normalized entity name → list of memory IDs
+        // Build a map from normalized entity name to memory IDs.
         let entity_memory_map = self.build_entity_memory_map();
 
         let mut resolver = self.entity_resolver.write();
@@ -2476,7 +2495,7 @@ impl MenteDb {
         Ok(result)
     }
 
-    /// Build a map of normalized entity name → list of MemoryIds.
+    /// Build a map from normalized entity name to MemoryIds.
     fn build_entity_memory_map(&self) -> HashMap<String, Vec<MemoryId>> {
         let mut map: HashMap<String, Vec<MemoryId>> = HashMap::new();
         for mem in self.db.all_memories().unwrap_or_default() {
@@ -2504,7 +2523,7 @@ impl MenteDb {
 
     /// Get entity categories with their member entities for community detection.
     ///
-    /// Returns a map of category → list of (entity_name, context_snippet).
+    /// Returns a map from category to (entity_name, context_snippet) entries.
     /// Categories come from `entity_type:` tags on entity memories.
     pub fn entity_communities(&self) -> HashMap<String, Vec<(String, String)>> {
         let mut categories: HashMap<String, Vec<(String, String)>> = HashMap::new();
