@@ -27,6 +27,10 @@ pub enum MenteError {
     #[error("serialization error: {0}")]
     Serialization(String),
 
+    /// Caller supplied invalid input.
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+
     /// A capacity limit was exceeded.
     #[error("capacity exceeded: {0}")]
     CapacityExceeded(String),

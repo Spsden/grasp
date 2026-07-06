@@ -101,6 +101,103 @@ fn test_entity_recall_boosts_linked_memory() {
 }
 
 #[test]
+fn test_store_validated_extraction_persists_derived_claims() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = MenteDb::open(dir.path()).unwrap();
+
+    let memory = make_memory("Pratap uses Flutter for Synapse.", vec![1.0, 0.0]);
+    let memory_id = memory.id;
+    db.store(memory).unwrap();
+
+    let person = EntityRecord::new("person", "Pratap");
+    let person_id = person.entity_id.clone();
+    let project = EntityRecord::new("project", "Synapse");
+    let project_id = project.entity_id.clone();
+    let tech = EntityRecord::new("technology", "Flutter");
+    let tech_id = tech.entity_id.clone();
+    db.upsert_entity(person).unwrap();
+    db.upsert_entity(project).unwrap();
+    db.upsert_entity(tech).unwrap();
+
+    let mut run = ExtractionRun::new("claim_extractor", "v1");
+    run.source_memory_id = Some(memory_id);
+    run.status = "completed".to_string();
+
+    let mut claim = ClaimRecord::new("Pratap uses Flutter for Synapse", "fact");
+    claim.subject_entity_id = Some(person_id.clone());
+    claim.predicate = Some("uses".to_string());
+    claim.object_entity_id = Some(tech_id.clone());
+    claim.source_run_id = Some(run.run_id.clone());
+    let claim_id = claim.claim_id.clone();
+
+    let mut evidence = ClaimEvidence::new(claim_id.clone(), memory_id);
+    evidence.evidence_text = Some("Pratap uses Flutter for Synapse.".to_string());
+    evidence.span_start = Some(0);
+    evidence.span_end = Some(34);
+
+    let relationship = EntityRelationship::new(project_id.clone(), tech_id.clone(), "uses");
+    let relationship_id = relationship.relationship_id.clone();
+    let relationship_evidence = RelationshipEvidence::new(relationship_id.clone(), memory_id);
+
+    db.store_validated_extraction(ValidatedExtractionBatch {
+        run,
+        claims: vec![claim],
+        claim_entities: vec![
+            ClaimEntityLink {
+                claim_id: claim_id.clone(),
+                entity_id: person_id.clone(),
+                role: "subject".to_string(),
+                confidence: 0.95,
+            },
+            ClaimEntityLink {
+                claim_id: claim_id.clone(),
+                entity_id: tech_id.clone(),
+                role: "object".to_string(),
+                confidence: 0.95,
+            },
+        ],
+        claim_evidence: vec![evidence],
+        relationships: vec![relationship],
+        relationship_evidence: vec![relationship_evidence],
+    })
+    .unwrap();
+
+    let claims = db.claims_for_entity(&person_id).unwrap();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].predicate.as_deref(), Some("uses"));
+    assert_eq!(db.claim_evidence(&claim_id).unwrap().len(), 1);
+    assert_eq!(db.relationships_for_entity(&project_id).unwrap().len(), 1);
+    assert_eq!(db.relationship_evidence(&relationship_id).unwrap().len(), 1);
+    assert_eq!(db.extraction_runs_for_memory(memory_id).unwrap().len(), 1);
+
+    db.close().unwrap();
+}
+
+#[test]
+fn test_store_validated_extraction_rejects_bad_artifacts() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = MenteDb::open(dir.path()).unwrap();
+
+    let mut run = ExtractionRun::new("claim_extractor", "v1");
+    run.output_json = "[]".to_string();
+
+    let err = db
+        .store_validated_extraction(ValidatedExtractionBatch {
+            run,
+            claims: Vec::new(),
+            claim_entities: Vec::new(),
+            claim_evidence: Vec::new(),
+            relationships: Vec::new(),
+            relationship_evidence: Vec::new(),
+        })
+        .unwrap_err();
+
+    assert!(err.to_string().contains("JSON object"));
+    assert!(db.recent_extraction_runs(10).unwrap().is_empty());
+    db.close().unwrap();
+}
+
+#[test]
 fn test_forget_memory() {
     let dir = tempfile::tempdir().unwrap();
     let db = MenteDb::open(dir.path()).unwrap();

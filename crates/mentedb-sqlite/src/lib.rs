@@ -2818,6 +2818,52 @@ impl Backend {
         Ok(out)
     }
 
+    /// Persist one extraction run and all derived artifacts in one transaction.
+    pub fn persist_extraction_artifacts(
+        &self,
+        run: &ExtractionRun,
+        claims: &[ClaimRecord],
+        claim_entities: &[ClaimEntityLink],
+        claim_evidence: &[ClaimEvidence],
+        relationships: &[EntityRelationship],
+        relationship_evidence: &[RelationshipEvidence],
+    ) -> Result<(), MenteError> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(store_err)?;
+        Self::upsert_extraction_run_on(&tx, run)?;
+        for claim in claims {
+            Self::upsert_claim_on(&tx, claim)?;
+        }
+        for link in claim_entities {
+            Self::link_claim_entity_on(&tx, link)?;
+        }
+        for evidence in claim_evidence {
+            Self::add_claim_evidence_on(&tx, evidence)?;
+        }
+        for relationship in relationships {
+            Self::upsert_entity_relationship_on(&tx, relationship)?;
+        }
+        for evidence in relationship_evidence {
+            Self::add_relationship_evidence_on(&tx, evidence)?;
+        }
+        Self::record_operation_on(
+            &tx,
+            "extraction_artifacts_persist",
+            run.source_memory_id,
+            None,
+            None,
+            json!({
+                "run_id": run.run_id,
+                "claim_count": claims.len(),
+                "claim_entity_count": claim_entities.len(),
+                "claim_evidence_count": claim_evidence.len(),
+                "relationship_count": relationships.len(),
+                "relationship_evidence_count": relationship_evidence.len(),
+            }),
+        )?;
+        tx.commit().map_err(store_err)
+    }
+
     /// Load a memory by id, including its tags. Returns `None` if absent.
     pub fn get_memory(&self, id: MemoryId) -> Result<Option<MemoryNode>, MenteError> {
         let conn = self.conn.lock();

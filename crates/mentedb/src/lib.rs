@@ -95,12 +95,16 @@ pub use mentedb_query as query;
 /// SQLite storage backend and inspection types.
 pub use mentedb_sqlite as sqlite;
 pub use mentedb_sqlite::{
-    EntityAlias, EntityRecord, MemoryEntityLink, MemoryOperation, MemorySource, RetrievalConfig,
-    RetrievalTrace, RetrievalTraceHit,
+    ClaimEntityLink, ClaimEvidence, ClaimRecord, ConversationEvent, ConversationRecord,
+    EntityAlias, EntityRecord, EntityRelationship, ExtractionRun, MemoryEntityLink,
+    MemoryOperation, MemorySource, RelationshipEvidence, RetrievalConfig, RetrievalTrace,
+    RetrievalTraceHit,
 };
 
 /// Renderer-neutral graph projection DTOs for app clients.
 pub mod entity_extraction;
+/// Validated extraction job boundary for derived claims and relationships.
+pub mod extraction_jobs;
 pub mod graph_projection;
 /// Unified process_turn orchestration.
 pub mod process_turn;
@@ -112,6 +116,7 @@ pub mod sleep;
 pub mod enrichment;
 
 pub use entity_extraction::{EntityExtractionConfig, ExtractedEntity as ExtractedMemoryEntity};
+pub use extraction_jobs::{ValidatedExtractionBatch, validate_extraction_batch};
 pub use graph_projection::{
     GraphProjection, GraphProjectionConfig, GraphProjectionEdge, GraphProjectionNode,
 };
@@ -128,14 +133,17 @@ pub mod prelude {
     pub use mentedb_core::types::*;
     pub use mentedb_core::{MemoryEdge, MemoryNode, MemoryTier, MenteError};
     pub use mentedb_sqlite::{
-        EntityAlias, EntityRecord, MemoryEntityLink, MemoryOperation, MemorySource,
-        RetrievalConfig, RetrievalTrace, RetrievalTraceHit,
+        ClaimEntityLink, ClaimEvidence, ClaimRecord, ConversationEvent, ConversationRecord,
+        EntityAlias, EntityRecord, EntityRelationship, ExtractionRun, MemoryEntityLink,
+        MemoryOperation, MemorySource, RelationshipEvidence, RetrievalConfig, RetrievalTrace,
+        RetrievalTraceHit,
     };
 
     pub use crate::MenteDb;
     pub use crate::entity_extraction::{
         EntityExtractionConfig, ExtractedEntity as ExtractedMemoryEntity,
     };
+    pub use crate::extraction_jobs::{ValidatedExtractionBatch, validate_extraction_batch};
 }
 
 use std::collections::HashMap;
@@ -1010,6 +1018,56 @@ impl MenteDb {
         self.db.memory_sources(id)
     }
 
+    /// Add or update a conversation container.
+    pub fn upsert_conversation(&self, conversation: ConversationRecord) -> MenteResult<()> {
+        self.db.upsert_conversation(&conversation)
+    }
+
+    /// Add or update one observed event in a conversation timeline.
+    pub fn add_conversation_event(&self, event: ConversationEvent) -> MenteResult<()> {
+        self.db.add_conversation_event(&event)
+    }
+
+    /// Conversation events ordered by observed time.
+    pub fn conversation_events(
+        &self,
+        conversation_id: &str,
+        limit: usize,
+    ) -> MenteResult<Vec<ConversationEvent>> {
+        self.db.conversation_events(conversation_id, limit)
+    }
+
+    /// Add or update one extraction run.
+    pub fn upsert_extraction_run(&self, run: ExtractionRun) -> MenteResult<()> {
+        self.db.upsert_extraction_run(&run)
+    }
+
+    /// Extraction runs for one source memory, newest first.
+    pub fn extraction_runs_for_memory(
+        &self,
+        memory_id: MemoryId,
+    ) -> MenteResult<Vec<ExtractionRun>> {
+        self.db.extraction_runs_for_memory(memory_id)
+    }
+
+    /// Recent extraction runs, newest first.
+    pub fn recent_extraction_runs(&self, limit: usize) -> MenteResult<Vec<ExtractionRun>> {
+        self.db.recent_extraction_runs(limit)
+    }
+
+    /// Validate and persist derived extraction artifacts in one transaction.
+    pub fn store_validated_extraction(&self, batch: ValidatedExtractionBatch) -> MenteResult<()> {
+        validate_extraction_batch(&batch)?;
+        self.db.persist_extraction_artifacts(
+            &batch.run,
+            &batch.claims,
+            &batch.claim_entities,
+            &batch.claim_evidence,
+            &batch.relationships,
+            &batch.relationship_evidence,
+        )
+    }
+
     /// Add or update a canonical entity.
     pub fn upsert_entity(&self, entity: EntityRecord) -> MenteResult<()> {
         self.db.upsert_entity(&entity)
@@ -1053,6 +1111,42 @@ impl MenteDb {
     /// Memory links for one entity.
     pub fn memories_for_entity(&self, entity_id: &str) -> MenteResult<Vec<MemoryEntityLink>> {
         self.db.memories_for_entity(entity_id)
+    }
+
+    /// Add or update a derived claim.
+    pub fn upsert_claim(&self, claim: ClaimRecord) -> MenteResult<()> {
+        self.db.upsert_claim(&claim)
+    }
+
+    /// Claims linked to an entity, newest first.
+    pub fn claims_for_entity(&self, entity_id: &str) -> MenteResult<Vec<ClaimRecord>> {
+        self.db.claims_for_entity(entity_id)
+    }
+
+    /// Claims backed by evidence in a memory.
+    pub fn claims_for_memory(&self, memory_id: MemoryId) -> MenteResult<Vec<ClaimRecord>> {
+        self.db.claims_for_memory(memory_id)
+    }
+
+    /// Evidence rows for one claim.
+    pub fn claim_evidence(&self, claim_id: &str) -> MenteResult<Vec<ClaimEvidence>> {
+        self.db.claim_evidence(claim_id)
+    }
+
+    /// Relationships where an entity participates as source or target.
+    pub fn relationships_for_entity(
+        &self,
+        entity_id: &str,
+    ) -> MenteResult<Vec<EntityRelationship>> {
+        self.db.relationships_for_entity(entity_id)
+    }
+
+    /// Evidence rows for one entity relationship.
+    pub fn relationship_evidence(
+        &self,
+        relationship_id: &str,
+    ) -> MenteResult<Vec<RelationshipEvidence>> {
+        self.db.relationship_evidence(relationship_id)
     }
 
     /// Current retrieval tuning for hybrid and multi-query recall.
