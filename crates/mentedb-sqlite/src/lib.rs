@@ -32,7 +32,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::json;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: usize = 2;
+const SCHEMA_VERSION: usize = 3;
 
 /// Tunable retrieval parameters.
 ///
@@ -196,6 +196,249 @@ pub struct MemoryEntityLink {
     pub role: Option<String>,
     pub confidence: f32,
     pub evidence: Option<String>,
+}
+
+/// A durable conversation/session container.
+#[derive(Debug, Clone)]
+pub struct ConversationRecord {
+    pub conversation_id: String,
+    pub title: Option<String>,
+    pub metadata_json: String,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+}
+
+impl ConversationRecord {
+    pub fn new(conversation_id: impl Into<String>) -> Self {
+        let now = now_us();
+        Self {
+            conversation_id: conversation_id.into(),
+            title: None,
+            metadata_json: "{}".to_string(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+}
+
+/// One observed event in a conversation timeline.
+#[derive(Debug, Clone)]
+pub struct ConversationEvent {
+    pub event_id: String,
+    pub conversation_id: String,
+    pub turn_id: Option<String>,
+    pub event_type: String,
+    pub actor_id: Option<String>,
+    pub content: Option<String>,
+    pub payload_json: String,
+    pub observed_at: Timestamp,
+    pub created_at: Timestamp,
+}
+
+impl ConversationEvent {
+    pub fn new(conversation_id: impl Into<String>, event_type: impl Into<String>) -> Self {
+        let now = now_us();
+        Self {
+            event_id: Uuid::new_v4().to_string(),
+            conversation_id: conversation_id.into(),
+            turn_id: None,
+            event_type: event_type.into(),
+            actor_id: None,
+            content: None,
+            payload_json: "{}".to_string(),
+            observed_at: now,
+            created_at: now,
+        }
+    }
+}
+
+/// A versioned extraction attempt over raw memory or conversation data.
+#[derive(Debug, Clone)]
+pub struct ExtractionRun {
+    pub run_id: String,
+    pub source_memory_id: Option<MemoryId>,
+    pub conversation_id: Option<String>,
+    pub extractor: String,
+    pub extractor_version: String,
+    pub model: Option<String>,
+    pub prompt_hash: Option<String>,
+    pub config_hash: Option<String>,
+    pub status: String,
+    pub error: Option<String>,
+    pub output_json: String,
+    pub started_at: Timestamp,
+    pub completed_at: Option<Timestamp>,
+}
+
+impl ExtractionRun {
+    pub fn new(extractor: impl Into<String>, extractor_version: impl Into<String>) -> Self {
+        Self {
+            run_id: Uuid::new_v4().to_string(),
+            source_memory_id: None,
+            conversation_id: None,
+            extractor: extractor.into(),
+            extractor_version: extractor_version.into(),
+            model: None,
+            prompt_hash: None,
+            config_hash: None,
+            status: "pending".to_string(),
+            error: None,
+            output_json: "{}".to_string(),
+            started_at: now_us(),
+            completed_at: None,
+        }
+    }
+}
+
+/// An atomic derived claim, backed by source evidence.
+#[derive(Debug, Clone)]
+pub struct ClaimRecord {
+    pub claim_id: String,
+    pub claim_text: String,
+    pub claim_type: String,
+    pub subject_entity_id: Option<String>,
+    pub predicate: Option<String>,
+    pub object_entity_id: Option<String>,
+    pub confidence: f32,
+    pub status: String,
+    pub valid_from: Option<Timestamp>,
+    pub valid_until: Option<Timestamp>,
+    pub attributes_json: String,
+    pub source_run_id: Option<String>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+}
+
+impl ClaimRecord {
+    pub fn new(claim_text: impl Into<String>, claim_type: impl Into<String>) -> Self {
+        let now = now_us();
+        Self {
+            claim_id: Uuid::new_v4().to_string(),
+            claim_text: claim_text.into(),
+            claim_type: claim_type.into(),
+            subject_entity_id: None,
+            predicate: None,
+            object_entity_id: None,
+            confidence: 1.0,
+            status: "active".to_string(),
+            valid_from: None,
+            valid_until: None,
+            attributes_json: "{}".to_string(),
+            source_run_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+}
+
+/// Entity participation in a claim.
+#[derive(Debug, Clone)]
+pub struct ClaimEntityLink {
+    pub claim_id: String,
+    pub entity_id: String,
+    pub role: String,
+    pub confidence: f32,
+}
+
+/// Evidence span linking a claim back to canonical memory/source rows.
+#[derive(Debug, Clone)]
+pub struct ClaimEvidence {
+    pub evidence_id: String,
+    pub claim_id: String,
+    pub memory_id: MemoryId,
+    pub source_id: Option<String>,
+    pub evidence_text: Option<String>,
+    pub span_start: Option<i64>,
+    pub span_end: Option<i64>,
+    pub confidence: f32,
+    pub created_at: Timestamp,
+}
+
+impl ClaimEvidence {
+    pub fn new(claim_id: impl Into<String>, memory_id: MemoryId) -> Self {
+        Self {
+            evidence_id: Uuid::new_v4().to_string(),
+            claim_id: claim_id.into(),
+            memory_id,
+            source_id: None,
+            evidence_text: None,
+            span_start: None,
+            span_end: None,
+            confidence: 1.0,
+            created_at: now_us(),
+        }
+    }
+}
+
+/// A typed relationship between two canonical entities.
+#[derive(Debug, Clone)]
+pub struct EntityRelationship {
+    pub relationship_id: String,
+    pub source_entity_id: String,
+    pub target_entity_id: String,
+    pub relation_type: String,
+    pub confidence: f32,
+    pub status: String,
+    pub valid_from: Option<Timestamp>,
+    pub valid_until: Option<Timestamp>,
+    pub attributes_json: String,
+    pub source_run_id: Option<String>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+}
+
+impl EntityRelationship {
+    pub fn new(
+        source_entity_id: impl Into<String>,
+        target_entity_id: impl Into<String>,
+        relation_type: impl Into<String>,
+    ) -> Self {
+        let now = now_us();
+        Self {
+            relationship_id: Uuid::new_v4().to_string(),
+            source_entity_id: source_entity_id.into(),
+            target_entity_id: target_entity_id.into(),
+            relation_type: relation_type.into(),
+            confidence: 1.0,
+            status: "active".to_string(),
+            valid_from: None,
+            valid_until: None,
+            attributes_json: "{}".to_string(),
+            source_run_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+}
+
+/// Evidence span linking an entity relationship back to memory/source rows.
+#[derive(Debug, Clone)]
+pub struct RelationshipEvidence {
+    pub evidence_id: String,
+    pub relationship_id: String,
+    pub memory_id: MemoryId,
+    pub source_id: Option<String>,
+    pub evidence_text: Option<String>,
+    pub span_start: Option<i64>,
+    pub span_end: Option<i64>,
+    pub confidence: f32,
+    pub created_at: Timestamp,
+}
+
+impl RelationshipEvidence {
+    pub fn new(relationship_id: impl Into<String>, memory_id: MemoryId) -> Self {
+        Self {
+            evidence_id: Uuid::new_v4().to_string(),
+            relationship_id: relationship_id.into(),
+            memory_id,
+            source_id: None,
+            evidence_text: None,
+            span_start: None,
+            span_end: None,
+            confidence: 1.0,
+            created_at: now_us(),
+        }
+    }
 }
 
 /// Map any error into `MenteError::Storage` with a human-readable message.
@@ -693,6 +936,61 @@ impl Backend {
             CREATE INDEX IF NOT EXISTS idx_memory_sources_turn
                 ON memory_sources(conversation_id, turn_id);
 
+            CREATE TABLE IF NOT EXISTS conversations (
+                conversation_id TEXT PRIMARY KEY,
+                title           TEXT,
+                metadata_json   TEXT NOT NULL DEFAULT '{}',
+                created_at      INTEGER NOT NULL,
+                updated_at      INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_conversations_updated
+                ON conversations(updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS conversation_events (
+                event_id        TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                turn_id         TEXT,
+                event_type      TEXT NOT NULL,
+                actor_id        TEXT,
+                content         TEXT,
+                payload_json    TEXT NOT NULL DEFAULT '{}',
+                observed_at     INTEGER NOT NULL,
+                created_at      INTEGER NOT NULL,
+                FOREIGN KEY(conversation_id) REFERENCES conversations(conversation_id)
+                    ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_conversation_events_conversation
+                ON conversation_events(conversation_id, observed_at, created_at);
+            CREATE INDEX IF NOT EXISTS idx_conversation_events_turn
+                ON conversation_events(conversation_id, turn_id);
+            CREATE INDEX IF NOT EXISTS idx_conversation_events_type
+                ON conversation_events(event_type, observed_at DESC);
+
+            CREATE TABLE IF NOT EXISTS extraction_runs (
+                run_id           TEXT PRIMARY KEY,
+                source_memory_id TEXT,
+                conversation_id  TEXT,
+                extractor        TEXT NOT NULL,
+                extractor_version TEXT NOT NULL,
+                model            TEXT,
+                prompt_hash      TEXT,
+                config_hash      TEXT,
+                status           TEXT NOT NULL,
+                error            TEXT,
+                output_json      TEXT NOT NULL DEFAULT '{}',
+                started_at       INTEGER NOT NULL,
+                completed_at     INTEGER,
+                FOREIGN KEY(source_memory_id) REFERENCES memories(id) ON DELETE SET NULL,
+                FOREIGN KEY(conversation_id) REFERENCES conversations(conversation_id)
+                    ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_extraction_runs_memory
+                ON extraction_runs(source_memory_id, started_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_extraction_runs_conversation
+                ON extraction_runs(conversation_id, started_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_extraction_runs_status
+                ON extraction_runs(status, started_at DESC);
+
             CREATE TABLE IF NOT EXISTS entities (
                 entity_id       TEXT PRIMARY KEY,
                 entity_type     TEXT NOT NULL,
@@ -732,6 +1030,118 @@ impl Backend {
                 ON memory_entities(entity_id);
             CREATE INDEX IF NOT EXISTS idx_memory_entities_memory
                 ON memory_entities(memory_id);
+
+            CREATE TABLE IF NOT EXISTS claims (
+                claim_id          TEXT PRIMARY KEY,
+                claim_text        TEXT NOT NULL,
+                claim_type        TEXT NOT NULL,
+                subject_entity_id TEXT,
+                predicate         TEXT,
+                object_entity_id  TEXT,
+                confidence        REAL NOT NULL DEFAULT 1.0,
+                status            TEXT NOT NULL DEFAULT 'active',
+                valid_from        INTEGER,
+                valid_until       INTEGER,
+                attributes_json   TEXT NOT NULL DEFAULT '{}',
+                source_run_id     TEXT,
+                created_at        INTEGER NOT NULL,
+                updated_at        INTEGER NOT NULL,
+                FOREIGN KEY(subject_entity_id) REFERENCES entities(entity_id)
+                    ON DELETE SET NULL,
+                FOREIGN KEY(object_entity_id) REFERENCES entities(entity_id)
+                    ON DELETE SET NULL,
+                FOREIGN KEY(source_run_id) REFERENCES extraction_runs(run_id)
+                    ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_claims_status
+                ON claims(status, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_claims_subject
+                ON claims(subject_entity_id, predicate);
+            CREATE INDEX IF NOT EXISTS idx_claims_object
+                ON claims(object_entity_id);
+            CREATE INDEX IF NOT EXISTS idx_claims_valid
+                ON claims(valid_from, valid_until);
+
+            CREATE TABLE IF NOT EXISTS claim_entities (
+                claim_id   TEXT NOT NULL,
+                entity_id  TEXT NOT NULL,
+                role       TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 1.0,
+                PRIMARY KEY(claim_id, entity_id, role),
+                FOREIGN KEY(claim_id) REFERENCES claims(claim_id) ON DELETE CASCADE,
+                FOREIGN KEY(entity_id) REFERENCES entities(entity_id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_claim_entities_entity
+                ON claim_entities(entity_id, role);
+
+            CREATE TABLE IF NOT EXISTS claim_evidence (
+                evidence_id   TEXT PRIMARY KEY,
+                claim_id      TEXT NOT NULL,
+                memory_id     TEXT NOT NULL,
+                source_id     TEXT,
+                evidence_text TEXT,
+                span_start    INTEGER,
+                span_end      INTEGER,
+                confidence    REAL NOT NULL DEFAULT 1.0,
+                created_at    INTEGER NOT NULL,
+                FOREIGN KEY(claim_id) REFERENCES claims(claim_id) ON DELETE CASCADE,
+                FOREIGN KEY(memory_id) REFERENCES memories(id) ON DELETE CASCADE,
+                FOREIGN KEY(source_id) REFERENCES memory_sources(source_id)
+                    ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_claim_evidence_claim
+                ON claim_evidence(claim_id, confidence DESC);
+            CREATE INDEX IF NOT EXISTS idx_claim_evidence_memory
+                ON claim_evidence(memory_id);
+
+            CREATE TABLE IF NOT EXISTS entity_relationships (
+                relationship_id  TEXT PRIMARY KEY,
+                source_entity_id TEXT NOT NULL,
+                target_entity_id TEXT NOT NULL,
+                relation_type    TEXT NOT NULL,
+                confidence       REAL NOT NULL DEFAULT 1.0,
+                status           TEXT NOT NULL DEFAULT 'active',
+                valid_from       INTEGER,
+                valid_until      INTEGER,
+                attributes_json  TEXT NOT NULL DEFAULT '{}',
+                source_run_id    TEXT,
+                created_at       INTEGER NOT NULL,
+                updated_at       INTEGER NOT NULL,
+                FOREIGN KEY(source_entity_id) REFERENCES entities(entity_id)
+                    ON DELETE CASCADE,
+                FOREIGN KEY(target_entity_id) REFERENCES entities(entity_id)
+                    ON DELETE CASCADE,
+                FOREIGN KEY(source_run_id) REFERENCES extraction_runs(run_id)
+                    ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_entity_relationships_source
+                ON entity_relationships(source_entity_id, relation_type);
+            CREATE INDEX IF NOT EXISTS idx_entity_relationships_target
+                ON entity_relationships(target_entity_id, relation_type);
+            CREATE INDEX IF NOT EXISTS idx_entity_relationships_status
+                ON entity_relationships(status, updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS relationship_evidence (
+                evidence_id     TEXT PRIMARY KEY,
+                relationship_id TEXT NOT NULL,
+                memory_id       TEXT NOT NULL,
+                source_id       TEXT,
+                evidence_text   TEXT,
+                span_start      INTEGER,
+                span_end        INTEGER,
+                confidence      REAL NOT NULL DEFAULT 1.0,
+                created_at      INTEGER NOT NULL,
+                FOREIGN KEY(relationship_id)
+                    REFERENCES entity_relationships(relationship_id)
+                    ON DELETE CASCADE,
+                FOREIGN KEY(memory_id) REFERENCES memories(id) ON DELETE CASCADE,
+                FOREIGN KEY(source_id) REFERENCES memory_sources(source_id)
+                    ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_relationship_evidence_relationship
+                ON relationship_evidence(relationship_id, confidence DESC);
+            CREATE INDEX IF NOT EXISTS idx_relationship_evidence_memory
+                ON relationship_evidence(memory_id);
 
             CREATE TABLE IF NOT EXISTS retrieval_traces (
                 trace_id            TEXT PRIMARY KEY,
@@ -1029,6 +1439,406 @@ impl Backend {
         Ok(())
     }
 
+    fn upsert_conversation_on(
+        tx: &rusqlite::Transaction<'_>,
+        conversation: &ConversationRecord,
+    ) -> Result<(), MenteError> {
+        tx.execute(
+            r#"
+            INSERT INTO conversations (
+                conversation_id, title, metadata_json, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(conversation_id) DO UPDATE SET
+                title = excluded.title,
+                metadata_json = excluded.metadata_json,
+                updated_at = excluded.updated_at
+            "#,
+            params![
+                conversation.conversation_id,
+                conversation.title.as_deref(),
+                conversation.metadata_json,
+                conversation.created_at as i64,
+                conversation.updated_at as i64,
+            ],
+        )
+        .map_err(store_err)?;
+        Self::record_operation_on(
+            tx,
+            "conversation_upsert",
+            None,
+            None,
+            None,
+            json!({
+                "conversation_id": conversation.conversation_id,
+                "title": conversation.title,
+            }),
+        )?;
+        Ok(())
+    }
+
+    fn insert_conversation_event_on(
+        tx: &rusqlite::Transaction<'_>,
+        event: &ConversationEvent,
+    ) -> Result<(), MenteError> {
+        tx.execute(
+            r#"
+            INSERT INTO conversation_events (
+                event_id, conversation_id, turn_id, event_type, actor_id,
+                content, payload_json, observed_at, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            ON CONFLICT(event_id) DO UPDATE SET
+                conversation_id = excluded.conversation_id,
+                turn_id = excluded.turn_id,
+                event_type = excluded.event_type,
+                actor_id = excluded.actor_id,
+                content = excluded.content,
+                payload_json = excluded.payload_json,
+                observed_at = excluded.observed_at
+            "#,
+            params![
+                event.event_id,
+                event.conversation_id,
+                event.turn_id.as_deref(),
+                event.event_type,
+                event.actor_id.as_deref(),
+                event.content.as_deref(),
+                event.payload_json,
+                event.observed_at as i64,
+                event.created_at as i64,
+            ],
+        )
+        .map_err(store_err)?;
+        Self::record_operation_on(
+            tx,
+            "conversation_event_upsert",
+            None,
+            None,
+            None,
+            json!({
+                "event_id": event.event_id,
+                "conversation_id": event.conversation_id,
+                "turn_id": event.turn_id,
+                "event_type": event.event_type,
+                "actor_id": event.actor_id,
+                "observed_at": event.observed_at,
+            }),
+        )?;
+        Ok(())
+    }
+
+    fn upsert_extraction_run_on(
+        tx: &rusqlite::Transaction<'_>,
+        run: &ExtractionRun,
+    ) -> Result<(), MenteError> {
+        tx.execute(
+            r#"
+            INSERT INTO extraction_runs (
+                run_id, source_memory_id, conversation_id, extractor,
+                extractor_version, model, prompt_hash, config_hash, status,
+                error, output_json, started_at, completed_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            ON CONFLICT(run_id) DO UPDATE SET
+                source_memory_id = excluded.source_memory_id,
+                conversation_id = excluded.conversation_id,
+                extractor = excluded.extractor,
+                extractor_version = excluded.extractor_version,
+                model = excluded.model,
+                prompt_hash = excluded.prompt_hash,
+                config_hash = excluded.config_hash,
+                status = excluded.status,
+                error = excluded.error,
+                output_json = excluded.output_json,
+                completed_at = excluded.completed_at
+            "#,
+            params![
+                run.run_id,
+                run.source_memory_id.map(|id| id.to_string()),
+                run.conversation_id.as_deref(),
+                run.extractor,
+                run.extractor_version,
+                run.model.as_deref(),
+                run.prompt_hash.as_deref(),
+                run.config_hash.as_deref(),
+                run.status,
+                run.error.as_deref(),
+                run.output_json,
+                run.started_at as i64,
+                run.completed_at.map(|t| t as i64),
+            ],
+        )
+        .map_err(store_err)?;
+        Self::record_operation_on(
+            tx,
+            "extraction_run_upsert",
+            run.source_memory_id,
+            None,
+            None,
+            json!({
+                "run_id": run.run_id,
+                "conversation_id": run.conversation_id,
+                "extractor": run.extractor,
+                "extractor_version": run.extractor_version,
+                "model": run.model,
+                "prompt_hash": run.prompt_hash,
+                "config_hash": run.config_hash,
+                "status": run.status,
+            }),
+        )?;
+        Ok(())
+    }
+
+    fn upsert_claim_on(
+        tx: &rusqlite::Transaction<'_>,
+        claim: &ClaimRecord,
+    ) -> Result<(), MenteError> {
+        tx.execute(
+            r#"
+            INSERT INTO claims (
+                claim_id, claim_text, claim_type, subject_entity_id, predicate,
+                object_entity_id, confidence, status, valid_from, valid_until,
+                attributes_json, source_run_id, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            ON CONFLICT(claim_id) DO UPDATE SET
+                claim_text = excluded.claim_text,
+                claim_type = excluded.claim_type,
+                subject_entity_id = excluded.subject_entity_id,
+                predicate = excluded.predicate,
+                object_entity_id = excluded.object_entity_id,
+                confidence = excluded.confidence,
+                status = excluded.status,
+                valid_from = excluded.valid_from,
+                valid_until = excluded.valid_until,
+                attributes_json = excluded.attributes_json,
+                source_run_id = excluded.source_run_id,
+                updated_at = excluded.updated_at
+            "#,
+            params![
+                claim.claim_id,
+                claim.claim_text,
+                claim.claim_type,
+                claim.subject_entity_id.as_deref(),
+                claim.predicate.as_deref(),
+                claim.object_entity_id.as_deref(),
+                claim.confidence as f64,
+                claim.status,
+                claim.valid_from.map(|t| t as i64),
+                claim.valid_until.map(|t| t as i64),
+                claim.attributes_json,
+                claim.source_run_id.as_deref(),
+                claim.created_at as i64,
+                claim.updated_at as i64,
+            ],
+        )
+        .map_err(store_err)?;
+        Self::record_operation_on(
+            tx,
+            "claim_upsert",
+            None,
+            None,
+            None,
+            json!({
+                "claim_id": claim.claim_id,
+                "claim_type": claim.claim_type,
+                "subject_entity_id": claim.subject_entity_id,
+                "predicate": claim.predicate,
+                "object_entity_id": claim.object_entity_id,
+                "confidence": claim.confidence,
+                "status": claim.status,
+                "source_run_id": claim.source_run_id,
+            }),
+        )?;
+        Ok(())
+    }
+
+    fn link_claim_entity_on(
+        tx: &rusqlite::Transaction<'_>,
+        link: &ClaimEntityLink,
+    ) -> Result<(), MenteError> {
+        tx.execute(
+            r#"
+            INSERT INTO claim_entities (claim_id, entity_id, role, confidence)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(claim_id, entity_id, role) DO UPDATE SET
+                confidence = excluded.confidence
+            "#,
+            params![
+                link.claim_id,
+                link.entity_id,
+                link.role,
+                link.confidence as f64,
+            ],
+        )
+        .map_err(store_err)?;
+        Self::record_operation_on(
+            tx,
+            "claim_entity_link_upsert",
+            None,
+            None,
+            None,
+            json!({
+                "claim_id": link.claim_id,
+                "entity_id": link.entity_id,
+                "role": link.role,
+                "confidence": link.confidence,
+            }),
+        )?;
+        Ok(())
+    }
+
+    fn add_claim_evidence_on(
+        tx: &rusqlite::Transaction<'_>,
+        evidence: &ClaimEvidence,
+    ) -> Result<(), MenteError> {
+        tx.execute(
+            r#"
+            INSERT INTO claim_evidence (
+                evidence_id, claim_id, memory_id, source_id, evidence_text,
+                span_start, span_end, confidence, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            ON CONFLICT(evidence_id) DO UPDATE SET
+                claim_id = excluded.claim_id,
+                memory_id = excluded.memory_id,
+                source_id = excluded.source_id,
+                evidence_text = excluded.evidence_text,
+                span_start = excluded.span_start,
+                span_end = excluded.span_end,
+                confidence = excluded.confidence
+            "#,
+            params![
+                evidence.evidence_id,
+                evidence.claim_id,
+                evidence.memory_id.to_string(),
+                evidence.source_id.as_deref(),
+                evidence.evidence_text.as_deref(),
+                evidence.span_start,
+                evidence.span_end,
+                evidence.confidence as f64,
+                evidence.created_at as i64,
+            ],
+        )
+        .map_err(store_err)?;
+        Self::record_operation_on(
+            tx,
+            "claim_evidence_upsert",
+            Some(evidence.memory_id),
+            None,
+            None,
+            json!({
+                "evidence_id": evidence.evidence_id,
+                "claim_id": evidence.claim_id,
+                "source_id": evidence.source_id,
+                "confidence": evidence.confidence,
+            }),
+        )?;
+        Ok(())
+    }
+
+    fn upsert_entity_relationship_on(
+        tx: &rusqlite::Transaction<'_>,
+        relationship: &EntityRelationship,
+    ) -> Result<(), MenteError> {
+        tx.execute(
+            r#"
+            INSERT INTO entity_relationships (
+                relationship_id, source_entity_id, target_entity_id,
+                relation_type, confidence, status, valid_from, valid_until,
+                attributes_json, source_run_id, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            ON CONFLICT(relationship_id) DO UPDATE SET
+                source_entity_id = excluded.source_entity_id,
+                target_entity_id = excluded.target_entity_id,
+                relation_type = excluded.relation_type,
+                confidence = excluded.confidence,
+                status = excluded.status,
+                valid_from = excluded.valid_from,
+                valid_until = excluded.valid_until,
+                attributes_json = excluded.attributes_json,
+                source_run_id = excluded.source_run_id,
+                updated_at = excluded.updated_at
+            "#,
+            params![
+                relationship.relationship_id,
+                relationship.source_entity_id,
+                relationship.target_entity_id,
+                relationship.relation_type,
+                relationship.confidence as f64,
+                relationship.status,
+                relationship.valid_from.map(|t| t as i64),
+                relationship.valid_until.map(|t| t as i64),
+                relationship.attributes_json,
+                relationship.source_run_id.as_deref(),
+                relationship.created_at as i64,
+                relationship.updated_at as i64,
+            ],
+        )
+        .map_err(store_err)?;
+        Self::record_operation_on(
+            tx,
+            "entity_relationship_upsert",
+            None,
+            None,
+            None,
+            json!({
+                "relationship_id": relationship.relationship_id,
+                "source_entity_id": relationship.source_entity_id,
+                "target_entity_id": relationship.target_entity_id,
+                "relation_type": relationship.relation_type,
+                "confidence": relationship.confidence,
+                "status": relationship.status,
+                "source_run_id": relationship.source_run_id,
+            }),
+        )?;
+        Ok(())
+    }
+
+    fn add_relationship_evidence_on(
+        tx: &rusqlite::Transaction<'_>,
+        evidence: &RelationshipEvidence,
+    ) -> Result<(), MenteError> {
+        tx.execute(
+            r#"
+            INSERT INTO relationship_evidence (
+                evidence_id, relationship_id, memory_id, source_id, evidence_text,
+                span_start, span_end, confidence, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            ON CONFLICT(evidence_id) DO UPDATE SET
+                relationship_id = excluded.relationship_id,
+                memory_id = excluded.memory_id,
+                source_id = excluded.source_id,
+                evidence_text = excluded.evidence_text,
+                span_start = excluded.span_start,
+                span_end = excluded.span_end,
+                confidence = excluded.confidence
+            "#,
+            params![
+                evidence.evidence_id,
+                evidence.relationship_id,
+                evidence.memory_id.to_string(),
+                evidence.source_id.as_deref(),
+                evidence.evidence_text.as_deref(),
+                evidence.span_start,
+                evidence.span_end,
+                evidence.confidence as f64,
+                evidence.created_at as i64,
+            ],
+        )
+        .map_err(store_err)?;
+        Self::record_operation_on(
+            tx,
+            "relationship_evidence_upsert",
+            Some(evidence.memory_id),
+            None,
+            None,
+            json!({
+                "evidence_id": evidence.evidence_id,
+                "relationship_id": evidence.relationship_id,
+                "source_id": evidence.source_id,
+                "confidence": evidence.confidence,
+            }),
+        )?;
+        Ok(())
+    }
+
     fn store_memory_on(
         tx: &rusqlite::Transaction<'_>,
         node: &MemoryNode,
@@ -1228,6 +2038,170 @@ impl Backend {
                     prompt_hash: row.get(9)?,
                     payload_json: row.get(10)?,
                     created_at: row.get::<_, i64>(11)? as Timestamp,
+                })
+            })
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(store_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Add or update a conversation container.
+    pub fn upsert_conversation(&self, conversation: &ConversationRecord) -> Result<(), MenteError> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(store_err)?;
+        Self::upsert_conversation_on(&tx, conversation)?;
+        tx.commit().map_err(store_err)
+    }
+
+    /// Add or update an event in the conversation timeline.
+    pub fn add_conversation_event(&self, event: &ConversationEvent) -> Result<(), MenteError> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(store_err)?;
+        tx.execute(
+            r#"
+            INSERT OR IGNORE INTO conversations (
+                conversation_id, metadata_json, created_at, updated_at
+            ) VALUES (?1, '{}', ?2, ?2)
+            "#,
+            params![event.conversation_id, event.created_at as i64],
+        )
+        .map_err(store_err)?;
+        tx.execute(
+            "UPDATE conversations SET updated_at = MAX(updated_at, ?2) WHERE conversation_id = ?1",
+            params![event.conversation_id, event.observed_at as i64],
+        )
+        .map_err(store_err)?;
+        Self::insert_conversation_event_on(&tx, event)?;
+        tx.commit().map_err(store_err)
+    }
+
+    /// Conversation events ordered by observed time.
+    pub fn conversation_events(
+        &self,
+        conversation_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ConversationEvent>, MenteError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT event_id, conversation_id, turn_id, event_type, actor_id,
+                       content, payload_json, observed_at, created_at
+                FROM conversation_events
+                WHERE conversation_id = ?1
+                ORDER BY observed_at ASC, created_at ASC
+                LIMIT ?2
+                "#,
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![conversation_id, usize_to_i64(limit)?], |row| {
+                Ok(ConversationEvent {
+                    event_id: row.get(0)?,
+                    conversation_id: row.get(1)?,
+                    turn_id: row.get(2)?,
+                    event_type: row.get(3)?,
+                    actor_id: row.get(4)?,
+                    content: row.get(5)?,
+                    payload_json: row.get(6)?,
+                    observed_at: row.get::<_, i64>(7)? as Timestamp,
+                    created_at: row.get::<_, i64>(8)? as Timestamp,
+                })
+            })
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(store_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Add or update one extraction run.
+    pub fn upsert_extraction_run(&self, run: &ExtractionRun) -> Result<(), MenteError> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(store_err)?;
+        Self::upsert_extraction_run_on(&tx, run)?;
+        tx.commit().map_err(store_err)
+    }
+
+    /// Recent extraction runs, newest first.
+    pub fn recent_extraction_runs(&self, limit: usize) -> Result<Vec<ExtractionRun>, MenteError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT run_id, source_memory_id, conversation_id, extractor,
+                       extractor_version, model, prompt_hash, config_hash,
+                       status, error, output_json, started_at, completed_at
+                FROM extraction_runs
+                ORDER BY started_at DESC
+                LIMIT ?1
+                "#,
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![usize_to_i64(limit)?], |row| {
+                Ok(ExtractionRun {
+                    run_id: row.get(0)?,
+                    source_memory_id: parse_optional_memory_id(row.get(1)?),
+                    conversation_id: row.get(2)?,
+                    extractor: row.get(3)?,
+                    extractor_version: row.get(4)?,
+                    model: row.get(5)?,
+                    prompt_hash: row.get(6)?,
+                    config_hash: row.get(7)?,
+                    status: row.get(8)?,
+                    error: row.get(9)?,
+                    output_json: row.get(10)?,
+                    started_at: row.get::<_, i64>(11)? as Timestamp,
+                    completed_at: row.get::<_, Option<i64>>(12)?.map(|t| t as Timestamp),
+                })
+            })
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(store_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Extraction runs for one source memory, newest first.
+    pub fn extraction_runs_for_memory(
+        &self,
+        memory_id: MemoryId,
+    ) -> Result<Vec<ExtractionRun>, MenteError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT run_id, source_memory_id, conversation_id, extractor,
+                       extractor_version, model, prompt_hash, config_hash,
+                       status, error, output_json, started_at, completed_at
+                FROM extraction_runs
+                WHERE source_memory_id = ?1
+                ORDER BY started_at DESC
+                "#,
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![memory_id.to_string()], |row| {
+                Ok(ExtractionRun {
+                    run_id: row.get(0)?,
+                    source_memory_id: parse_optional_memory_id(row.get(1)?),
+                    conversation_id: row.get(2)?,
+                    extractor: row.get(3)?,
+                    extractor_version: row.get(4)?,
+                    model: row.get(5)?,
+                    prompt_hash: row.get(6)?,
+                    config_hash: row.get(7)?,
+                    status: row.get(8)?,
+                    error: row.get(9)?,
+                    output_json: row.get(10)?,
+                    started_at: row.get::<_, i64>(11)? as Timestamp,
+                    completed_at: row.get::<_, Option<i64>>(12)?.map(|t| t as Timestamp),
                 })
             })
             .map_err(store_err)?;
@@ -1546,6 +2520,294 @@ impl Backend {
                     role: if role.is_empty() { None } else { Some(role) },
                     confidence: row.get::<_, f64>(3)? as f32,
                     evidence: row.get(4)?,
+                })
+            })
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(store_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Add or update a derived claim.
+    pub fn upsert_claim(&self, claim: &ClaimRecord) -> Result<(), MenteError> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(store_err)?;
+        Self::upsert_claim_on(&tx, claim)?;
+        tx.commit().map_err(store_err)
+    }
+
+    /// Link a claim to an entity with a semantic role.
+    pub fn link_claim_entity(&self, link: &ClaimEntityLink) -> Result<(), MenteError> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(store_err)?;
+        Self::link_claim_entity_on(&tx, link)?;
+        tx.commit().map_err(store_err)
+    }
+
+    /// Add evidence for a claim.
+    pub fn add_claim_evidence(&self, evidence: &ClaimEvidence) -> Result<(), MenteError> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(store_err)?;
+        Self::add_claim_evidence_on(&tx, evidence)?;
+        tx.commit().map_err(store_err)
+    }
+
+    /// Persist a claim and all of its local links in one transaction.
+    pub fn upsert_claim_bundle(
+        &self,
+        claim: &ClaimRecord,
+        entities: &[ClaimEntityLink],
+        evidence: &[ClaimEvidence],
+    ) -> Result<(), MenteError> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(store_err)?;
+        Self::upsert_claim_on(&tx, claim)?;
+        for link in entities {
+            Self::link_claim_entity_on(&tx, link)?;
+        }
+        for item in evidence {
+            Self::add_claim_evidence_on(&tx, item)?;
+        }
+        tx.commit().map_err(store_err)
+    }
+
+    /// Claims linked to an entity, newest first.
+    pub fn claims_for_entity(&self, entity_id: &str) -> Result<Vec<ClaimRecord>, MenteError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT c.claim_id, c.claim_text, c.claim_type,
+                       c.subject_entity_id, c.predicate, c.object_entity_id,
+                       c.confidence, c.status, c.valid_from, c.valid_until,
+                       c.attributes_json, c.source_run_id, c.created_at, c.updated_at
+                FROM claims c
+                JOIN claim_entities ce ON ce.claim_id = c.claim_id
+                WHERE ce.entity_id = ?1
+                ORDER BY c.updated_at DESC
+                "#,
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![entity_id], |row| {
+                Ok(ClaimRecord {
+                    claim_id: row.get(0)?,
+                    claim_text: row.get(1)?,
+                    claim_type: row.get(2)?,
+                    subject_entity_id: row.get(3)?,
+                    predicate: row.get(4)?,
+                    object_entity_id: row.get(5)?,
+                    confidence: row.get::<_, f64>(6)? as f32,
+                    status: row.get(7)?,
+                    valid_from: row.get::<_, Option<i64>>(8)?.map(|t| t as Timestamp),
+                    valid_until: row.get::<_, Option<i64>>(9)?.map(|t| t as Timestamp),
+                    attributes_json: row.get(10)?,
+                    source_run_id: row.get(11)?,
+                    created_at: row.get::<_, i64>(12)? as Timestamp,
+                    updated_at: row.get::<_, i64>(13)? as Timestamp,
+                })
+            })
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(store_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Claims with evidence in a memory, newest first.
+    pub fn claims_for_memory(&self, memory_id: MemoryId) -> Result<Vec<ClaimRecord>, MenteError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT DISTINCT c.claim_id, c.claim_text, c.claim_type,
+                       c.subject_entity_id, c.predicate, c.object_entity_id,
+                       c.confidence, c.status, c.valid_from, c.valid_until,
+                       c.attributes_json, c.source_run_id, c.created_at, c.updated_at
+                FROM claims c
+                JOIN claim_evidence ev ON ev.claim_id = c.claim_id
+                WHERE ev.memory_id = ?1
+                ORDER BY c.updated_at DESC
+                "#,
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![memory_id.to_string()], |row| {
+                Ok(ClaimRecord {
+                    claim_id: row.get(0)?,
+                    claim_text: row.get(1)?,
+                    claim_type: row.get(2)?,
+                    subject_entity_id: row.get(3)?,
+                    predicate: row.get(4)?,
+                    object_entity_id: row.get(5)?,
+                    confidence: row.get::<_, f64>(6)? as f32,
+                    status: row.get(7)?,
+                    valid_from: row.get::<_, Option<i64>>(8)?.map(|t| t as Timestamp),
+                    valid_until: row.get::<_, Option<i64>>(9)?.map(|t| t as Timestamp),
+                    attributes_json: row.get(10)?,
+                    source_run_id: row.get(11)?,
+                    created_at: row.get::<_, i64>(12)? as Timestamp,
+                    updated_at: row.get::<_, i64>(13)? as Timestamp,
+                })
+            })
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(store_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Evidence rows for one claim.
+    pub fn claim_evidence(&self, claim_id: &str) -> Result<Vec<ClaimEvidence>, MenteError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT evidence_id, claim_id, memory_id, source_id, evidence_text,
+                       span_start, span_end, confidence, created_at
+                FROM claim_evidence
+                WHERE claim_id = ?1
+                ORDER BY confidence DESC, created_at ASC
+                "#,
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![claim_id], |row| {
+                Ok(ClaimEvidence {
+                    evidence_id: row.get(0)?,
+                    claim_id: row.get(1)?,
+                    memory_id: parse_id::<MemoryId>(&row.get::<_, String>(2)?)
+                        .unwrap_or_else(|_| MemoryId::nil()),
+                    source_id: row.get(3)?,
+                    evidence_text: row.get(4)?,
+                    span_start: row.get(5)?,
+                    span_end: row.get(6)?,
+                    confidence: row.get::<_, f64>(7)? as f32,
+                    created_at: row.get::<_, i64>(8)? as Timestamp,
+                })
+            })
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(store_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Add or update a typed relationship between two entities.
+    pub fn upsert_entity_relationship(
+        &self,
+        relationship: &EntityRelationship,
+    ) -> Result<(), MenteError> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(store_err)?;
+        Self::upsert_entity_relationship_on(&tx, relationship)?;
+        tx.commit().map_err(store_err)
+    }
+
+    /// Add evidence for an entity relationship.
+    pub fn add_relationship_evidence(
+        &self,
+        evidence: &RelationshipEvidence,
+    ) -> Result<(), MenteError> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(store_err)?;
+        Self::add_relationship_evidence_on(&tx, evidence)?;
+        tx.commit().map_err(store_err)
+    }
+
+    /// Persist a relationship and evidence in one transaction.
+    pub fn upsert_relationship_bundle(
+        &self,
+        relationship: &EntityRelationship,
+        evidence: &[RelationshipEvidence],
+    ) -> Result<(), MenteError> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(store_err)?;
+        Self::upsert_entity_relationship_on(&tx, relationship)?;
+        for item in evidence {
+            Self::add_relationship_evidence_on(&tx, item)?;
+        }
+        tx.commit().map_err(store_err)
+    }
+
+    /// Relationships where the entity participates as source or target.
+    pub fn relationships_for_entity(
+        &self,
+        entity_id: &str,
+    ) -> Result<Vec<EntityRelationship>, MenteError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT relationship_id, source_entity_id, target_entity_id,
+                       relation_type, confidence, status, valid_from, valid_until,
+                       attributes_json, source_run_id, created_at, updated_at
+                FROM entity_relationships
+                WHERE source_entity_id = ?1 OR target_entity_id = ?1
+                ORDER BY updated_at DESC
+                "#,
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![entity_id], |row| {
+                Ok(EntityRelationship {
+                    relationship_id: row.get(0)?,
+                    source_entity_id: row.get(1)?,
+                    target_entity_id: row.get(2)?,
+                    relation_type: row.get(3)?,
+                    confidence: row.get::<_, f64>(4)? as f32,
+                    status: row.get(5)?,
+                    valid_from: row.get::<_, Option<i64>>(6)?.map(|t| t as Timestamp),
+                    valid_until: row.get::<_, Option<i64>>(7)?.map(|t| t as Timestamp),
+                    attributes_json: row.get(8)?,
+                    source_run_id: row.get(9)?,
+                    created_at: row.get::<_, i64>(10)? as Timestamp,
+                    updated_at: row.get::<_, i64>(11)? as Timestamp,
+                })
+            })
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(store_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Evidence rows for one relationship.
+    pub fn relationship_evidence(
+        &self,
+        relationship_id: &str,
+    ) -> Result<Vec<RelationshipEvidence>, MenteError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT evidence_id, relationship_id, memory_id, source_id,
+                       evidence_text, span_start, span_end, confidence, created_at
+                FROM relationship_evidence
+                WHERE relationship_id = ?1
+                ORDER BY confidence DESC, created_at ASC
+                "#,
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![relationship_id], |row| {
+                Ok(RelationshipEvidence {
+                    evidence_id: row.get(0)?,
+                    relationship_id: row.get(1)?,
+                    memory_id: parse_id::<MemoryId>(&row.get::<_, String>(2)?)
+                        .unwrap_or_else(|_| MemoryId::nil()),
+                    source_id: row.get(3)?,
+                    evidence_text: row.get(4)?,
+                    span_start: row.get(5)?,
+                    span_end: row.get(6)?,
+                    confidence: row.get::<_, f64>(7)? as f32,
+                    created_at: row.get::<_, i64>(8)? as Timestamp,
                 })
             })
             .map_err(store_err)?;
@@ -2306,7 +3568,7 @@ impl Backend {
 
         // 1) Candidate filter set from tags + time window.
         let candidate_set = self.candidate_set(tags, tags_or, time_range)?;
-        // Filters requested but nothing matches → no results.
+        // Filters requested but nothing matches, so there are no results.
         if matches!(candidate_set.as_ref().map(|s| s.len()), Some(0)) {
             if self.retrieval_tracing_enabled()
                 && let Err(e) = self.record_retrieval_trace(
@@ -2442,8 +3704,8 @@ impl Backend {
         }
     }
 
-    /// Memory ids carrying the requested tags. `or = true` → union (any tag),
-    /// `or = false` → intersection (all tags).
+    /// Memory ids carrying the requested tags. `or = true` means union (any
+    /// tag), `or = false` means intersection (all tags).
     fn ids_matching_tags(&self, tags: &[&str], or: bool) -> MenteResult<HashSet<MemoryId>> {
         if tags.is_empty() {
             return Ok(HashSet::new());
@@ -2567,7 +3829,7 @@ impl Backend {
                 for row in rows {
                     match row {
                         Ok(id) => out.push(id),
-                        // MATCH syntax error / bad token → treat as no matches.
+                        // MATCH syntax error or bad token, treat as no matches.
                         Err(_) => {
                             out.clear();
                             break;
@@ -2968,6 +4230,170 @@ mod tests {
     }
 
     #[test]
+    fn conversation_events_roundtrip() {
+        let db = Backend::open_in_memory(2).unwrap();
+        let mut conversation = ConversationRecord::new("conv-1");
+        conversation.title = Some("Synapse planning".to_string());
+        conversation.metadata_json = json!({"source": "test"}).to_string();
+        db.upsert_conversation(&conversation).unwrap();
+
+        let mut join = ConversationEvent::new("conv-1", "participant_joined");
+        join.actor_id = Some("pratap".to_string());
+        join.payload_json = json!({"role": "owner"}).to_string();
+        join.observed_at = 10;
+        let mut message = ConversationEvent::new("conv-1", "user_message");
+        message.turn_id = Some("turn-1".to_string());
+        message.actor_id = Some("pratap".to_string());
+        message.content = Some("Synapse should remember Flutter preferences".to_string());
+        message.observed_at = 20;
+
+        db.add_conversation_event(&message).unwrap();
+        db.add_conversation_event(&join).unwrap();
+
+        let events = db.conversation_events("conv-1", 10).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, "participant_joined");
+        assert_eq!(events[1].turn_id.as_deref(), Some("turn-1"));
+
+        let operations = db.recent_operations(10).unwrap();
+        assert!(
+            operations
+                .iter()
+                .any(|op| op.operation_type == "conversation_event_upsert")
+        );
+    }
+
+    #[test]
+    fn extraction_runs_roundtrip_with_source_memory() {
+        let db = Backend::open_in_memory(2).unwrap();
+        let id = MemoryId::new();
+        db.store_memory(&make_node(id, "raw episode", vec![1.0, 0.0]))
+            .unwrap();
+
+        let mut run = ExtractionRun::new("claim_extractor", "v1");
+        run.source_memory_id = Some(id);
+        run.extractor_version = "2026-07-06".to_string();
+        run.model = Some("local-test-model".to_string());
+        run.prompt_hash = Some("prompt-sha".to_string());
+        run.config_hash = Some("config-sha".to_string());
+        run.status = "completed".to_string();
+        run.output_json = json!({"claims": 1}).to_string();
+        run.completed_at = Some(run.started_at + 1);
+
+        db.upsert_extraction_run(&run).unwrap();
+
+        let by_memory = db.extraction_runs_for_memory(id).unwrap();
+        assert_eq!(by_memory.len(), 1);
+        assert_eq!(by_memory[0].run_id, run.run_id);
+        assert_eq!(by_memory[0].status, "completed");
+
+        let recent = db.recent_extraction_runs(10).unwrap();
+        assert_eq!(recent[0].extractor, "claim_extractor");
+    }
+
+    #[test]
+    fn claims_relationships_and_evidence_roundtrip() {
+        let db = Backend::open_in_memory(2).unwrap();
+        let memory_id = MemoryId::new();
+        db.store_memory(&make_node(
+            memory_id,
+            "Pratap uses Flutter for Synapse.",
+            vec![1.0, 0.0],
+        ))
+        .unwrap();
+
+        let person = EntityRecord::new("person", "Pratap");
+        let person_id = person.entity_id.clone();
+        let project = EntityRecord::new("project", "Synapse");
+        let project_id = project.entity_id.clone();
+        let tech = EntityRecord::new("technology", "Flutter");
+        let tech_id = tech.entity_id.clone();
+        db.upsert_entity_bundle(&[person, project, tech], &[], &[])
+            .unwrap();
+
+        let mut run = ExtractionRun::new("claim_extractor", "v1");
+        run.source_memory_id = Some(memory_id);
+        run.status = "completed".to_string();
+        db.upsert_extraction_run(&run).unwrap();
+
+        let mut claim = ClaimRecord::new("Pratap uses Flutter for Synapse", "fact");
+        claim.subject_entity_id = Some(person_id.clone());
+        claim.predicate = Some("uses".to_string());
+        claim.object_entity_id = Some(tech_id.clone());
+        claim.source_run_id = Some(run.run_id.clone());
+        claim.confidence = 0.92;
+        let claim_id = claim.claim_id.clone();
+
+        let mut evidence = ClaimEvidence::new(claim_id.clone(), memory_id);
+        evidence.evidence_text = Some("Pratap uses Flutter for Synapse.".to_string());
+        evidence.span_start = Some(0);
+        evidence.span_end = Some(34);
+        evidence.confidence = 0.9;
+
+        db.upsert_claim_bundle(
+            &claim,
+            &[
+                ClaimEntityLink {
+                    claim_id: claim_id.clone(),
+                    entity_id: person_id.clone(),
+                    role: "subject".to_string(),
+                    confidence: 0.92,
+                },
+                ClaimEntityLink {
+                    claim_id: claim_id.clone(),
+                    entity_id: tech_id.clone(),
+                    role: "object".to_string(),
+                    confidence: 0.92,
+                },
+            ],
+            &[evidence],
+        )
+        .unwrap();
+
+        let by_entity = db.claims_for_entity(&person_id).unwrap();
+        assert_eq!(by_entity.len(), 1);
+        assert_eq!(by_entity[0].claim_id, claim_id);
+
+        let by_memory = db.claims_for_memory(memory_id).unwrap();
+        assert_eq!(by_memory.len(), 1);
+        assert_eq!(by_memory[0].predicate.as_deref(), Some("uses"));
+
+        let evidence_rows = db.claim_evidence(&claim_id).unwrap();
+        assert_eq!(evidence_rows.len(), 1);
+        assert_eq!(evidence_rows[0].span_start, Some(0));
+
+        let mut relationship = EntityRelationship::new(project_id.clone(), tech_id.clone(), "uses");
+        relationship.source_run_id = Some(run.run_id.clone());
+        relationship.confidence = 0.91;
+        let relationship_id = relationship.relationship_id.clone();
+        let mut relationship_evidence =
+            RelationshipEvidence::new(relationship_id.clone(), memory_id);
+        relationship_evidence.evidence_text = Some("Synapse uses Flutter".to_string());
+
+        db.upsert_relationship_bundle(&relationship, &[relationship_evidence])
+            .unwrap();
+
+        let project_relationships = db.relationships_for_entity(&project_id).unwrap();
+        assert_eq!(project_relationships.len(), 1);
+        assert_eq!(project_relationships[0].relation_type, "uses");
+
+        let rel_evidence = db.relationship_evidence(&relationship_id).unwrap();
+        assert_eq!(rel_evidence.len(), 1);
+
+        let operations = db.recent_operations(20).unwrap();
+        assert!(
+            operations
+                .iter()
+                .any(|op| op.operation_type == "claim_upsert")
+        );
+        assert!(
+            operations
+                .iter()
+                .any(|op| op.operation_type == "entity_relationship_upsert")
+        );
+    }
+
+    #[test]
     fn retrieval_tracing_records_rank_inputs() {
         let db = Backend::open_in_memory(2).unwrap();
         db.set_retrieval_tracing(true);
@@ -3072,7 +4498,7 @@ mod tests {
             assert_eq!(db.embedding_dim(), 0);
             db.store_memory(&make_node(id, "deferred", vec![1.0, 0.0]))
                 .unwrap();
-            // No vec0 yet → KNN unavailable.
+            // No vec0 yet, KNN is unavailable.
             assert!(db.knn(&[1.0, 0.0], 5).unwrap().is_empty());
             // Configuring the embedder builds the index and backfills.
             db.ensure_vector_index(2).unwrap();

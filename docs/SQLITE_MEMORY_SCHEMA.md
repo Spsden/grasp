@@ -182,9 +182,17 @@ Current operation types:
 - `edge_delete_for_memory`
 - `vector_index_rebuild`
 - `memory_source_upsert`
+- `conversation_upsert`
+- `conversation_event_upsert`
+- `extraction_run_upsert`
 - `entity_upsert`
 - `entity_alias_upsert`
 - `memory_entity_link_upsert`
+- `claim_upsert`
+- `claim_entity_link_upsert`
+- `claim_evidence_upsert`
+- `entity_relationship_upsert`
+- `relationship_evidence_upsert`
 
 ### `memory_sources`
 
@@ -221,6 +229,79 @@ Why it helps:
   sync, or consolidation.
 - Compare extraction models and prompt versions.
 - Replay extraction from the same source later.
+
+### `conversations`
+
+Durable container for a chat thread, meeting, agent session, or imported
+timeline.
+
+```sql
+CREATE TABLE conversations (
+    conversation_id TEXT PRIMARY KEY,
+    title           TEXT,
+    metadata_json   TEXT NOT NULL DEFAULT '{}',
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL
+);
+
+CREATE INDEX idx_conversations_updated
+    ON conversations(updated_at DESC);
+```
+
+### `conversation_events`
+
+Appendable observed events inside a conversation. A message, tool call,
+participant join, participant leave, file observation, or system event can all
+be represented here.
+
+```sql
+CREATE TABLE conversation_events (
+    event_id        TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL,
+    turn_id         TEXT,
+    event_type      TEXT NOT NULL,
+    actor_id        TEXT,
+    content         TEXT,
+    payload_json    TEXT NOT NULL DEFAULT '{}',
+    observed_at     INTEGER NOT NULL,
+    created_at      INTEGER NOT NULL,
+    FOREIGN KEY(conversation_id) REFERENCES conversations(conversation_id)
+        ON DELETE CASCADE
+);
+```
+
+Why event rows help:
+
+- A turn is no longer guessed from text. It is an observed event boundary.
+- Real conversations can include joins, leaves, tool calls, and non-message
+  context.
+- Memory extraction can be replayed from an exact timeline.
+
+### `extraction_runs`
+
+Versioned extraction attempts over a source memory or conversation.
+
+```sql
+CREATE TABLE extraction_runs (
+    run_id            TEXT PRIMARY KEY,
+    source_memory_id  TEXT,
+    conversation_id   TEXT,
+    extractor         TEXT NOT NULL,
+    extractor_version TEXT NOT NULL,
+    model             TEXT,
+    prompt_hash       TEXT,
+    config_hash       TEXT,
+    status            TEXT NOT NULL,
+    error             TEXT,
+    output_json       TEXT NOT NULL DEFAULT '{}',
+    started_at        INTEGER NOT NULL,
+    completed_at      INTEGER
+);
+```
+
+Extraction runs make LLM-derived memory auditable. A derived claim should be
+traceable to the extractor name, extractor version, model, prompt hash, config
+hash, raw output, and source evidence.
 
 ### `entities`
 
@@ -289,6 +370,110 @@ Why the entity tables help:
   embeddings.
 - Allow deterministic filters before vector search.
 - Give the graph better nodes than only memory-to-memory edges.
+
+### `claims`
+
+Atomic derived facts or preferences. Claims are not raw truth. They are
+evidence-backed interpretations that can be corrected, superseded, or rebuilt.
+
+```sql
+CREATE TABLE claims (
+    claim_id          TEXT PRIMARY KEY,
+    claim_text        TEXT NOT NULL,
+    claim_type        TEXT NOT NULL,
+    subject_entity_id TEXT,
+    predicate         TEXT,
+    object_entity_id  TEXT,
+    confidence        REAL NOT NULL DEFAULT 1.0,
+    status            TEXT NOT NULL DEFAULT 'active',
+    valid_from        INTEGER,
+    valid_until       INTEGER,
+    attributes_json   TEXT NOT NULL DEFAULT '{}',
+    source_run_id     TEXT,
+    created_at        INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL
+);
+```
+
+### `claim_entities`
+
+Links claim rows to participating entities.
+
+```sql
+CREATE TABLE claim_entities (
+    claim_id   TEXT NOT NULL,
+    entity_id  TEXT NOT NULL,
+    role       TEXT NOT NULL,
+    confidence REAL NOT NULL DEFAULT 1.0,
+    PRIMARY KEY(claim_id, entity_id, role)
+);
+```
+
+### `claim_evidence`
+
+Evidence spans for claims.
+
+```sql
+CREATE TABLE claim_evidence (
+    evidence_id   TEXT PRIMARY KEY,
+    claim_id      TEXT NOT NULL,
+    memory_id     TEXT NOT NULL,
+    source_id     TEXT,
+    evidence_text TEXT,
+    span_start    INTEGER,
+    span_end      INTEGER,
+    confidence    REAL NOT NULL DEFAULT 1.0,
+    created_at    INTEGER NOT NULL
+);
+```
+
+### `entity_relationships`
+
+Typed entity-to-entity relationships derived from evidence.
+
+```sql
+CREATE TABLE entity_relationships (
+    relationship_id  TEXT PRIMARY KEY,
+    source_entity_id TEXT NOT NULL,
+    target_entity_id TEXT NOT NULL,
+    relation_type    TEXT NOT NULL,
+    confidence       REAL NOT NULL DEFAULT 1.0,
+    status           TEXT NOT NULL DEFAULT 'active',
+    valid_from       INTEGER,
+    valid_until      INTEGER,
+    attributes_json  TEXT NOT NULL DEFAULT '{}',
+    source_run_id    TEXT,
+    created_at       INTEGER NOT NULL,
+    updated_at       INTEGER NOT NULL
+);
+```
+
+### `relationship_evidence`
+
+Evidence spans for entity relationships.
+
+```sql
+CREATE TABLE relationship_evidence (
+    evidence_id     TEXT PRIMARY KEY,
+    relationship_id TEXT NOT NULL,
+    memory_id       TEXT NOT NULL,
+    source_id       TEXT,
+    evidence_text   TEXT,
+    span_start      INTEGER,
+    span_end        INTEGER,
+    confidence      REAL NOT NULL DEFAULT 1.0,
+    created_at      INTEGER NOT NULL
+);
+```
+
+Why claims and relationships help:
+
+- They separate "what was said" from "what Grasp inferred".
+- Corrections can update derived claims without deleting raw episodes.
+- Debugging can point to exact evidence spans, extractor versions, and source
+  memories.
+- Future rerankers can search facts and relationships before falling back to
+  raw text.
 
 ### `retrieval_traces`
 
