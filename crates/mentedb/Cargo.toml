@@ -30,7 +30,8 @@ fs2 = { workspace = true }
 
 [features]
 default = []
-enrichment = ["dep:mentedb-extraction"]
+extraction = ["dep:mentedb-extraction"]
+enrichment = ["extraction"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

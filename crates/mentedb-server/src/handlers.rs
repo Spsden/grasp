@@ -13,6 +13,7 @@ use mentedb_core::edge::EdgeType;
 use mentedb_core::memory::{AttributeValue, MemoryType};
 use mentedb_core::space::Permission;
 use mentedb_core::{MemoryEdge, MemoryNode};
+use mentedb_extraction::schema::ExtractionResult;
 use mentedb_extraction::{
     ExtractionConfig, ExtractionPipeline, HttpExtractionProvider,
     map_extraction_type_to_memory_type,
@@ -151,6 +152,7 @@ pub async fn store_memory(
         let req = crate::extraction_queue::ExtractionRequest {
             config: state.extraction_config.clone().unwrap(),
             content: content.clone(),
+            source_memory_id: id,
             agent_id,
             space_id,
             db: state.db.clone(),
@@ -401,6 +403,10 @@ pub async fn ingest_conversation(
             .ok_or_else(|| ApiError::BadRequest("invalid 'space_id'".into()))?,
         None => SpaceId::nil(),
     };
+    let conversation_id = req
+        .get("conversation_id")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string);
 
     let stats = run_extraction(
         extraction_config,
@@ -408,6 +414,7 @@ pub async fn ingest_conversation(
         agent_id,
         space_id,
         &state.db,
+        conversation_id,
     )
     .await?;
 
@@ -421,6 +428,7 @@ async fn run_extraction(
     agent_id: AgentId,
     space_id: SpaceId,
     db: &mentedb::MenteDb,
+    conversation_id: Option<String>,
 ) -> Result<Value, ApiError> {
     let provider = HttpExtractionProvider::new(config.clone()).map_err(|e| {
         error!("extraction provider init failed: {e}");
@@ -429,22 +437,68 @@ async fn run_extraction(
 
     let pipeline = ExtractionPipeline::new(provider, config.clone());
 
-    let all_memories = pipeline
-        .extract_from_conversation(conversation)
-        .await
-        .map_err(|e| {
-            error!("extraction failed: {e}");
-            ApiError::Internal(format!("extraction failed: {e}"))
-        })?;
+    let full_result = pipeline.extract_full(conversation).await.map_err(|e| {
+        error!("extraction failed: {e}");
+        ApiError::Internal(format!("extraction failed: {e}"))
+    })?;
 
+    let all_memories = full_result.memories;
     let total_extracted = all_memories.len();
     let quality_passed = pipeline.filter_quality(&all_memories);
     let rejected_low_quality = total_extracted - quality_passed.len();
+    let relationships = full_result
+        .relationships
+        .into_iter()
+        .filter(|relationship| relationship.confidence >= config.quality_threshold)
+        .collect();
+    let durable_result = ExtractionResult {
+        memories: quality_passed.clone(),
+        entities: full_result.entities,
+        relationships,
+    };
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_micros() as u64;
+
+    let source_id = MemoryId::new();
+    let source_node = MemoryNode {
+        id: source_id,
+        agent_id,
+        memory_type: MemoryType::Episodic,
+        embedding: vec![],
+        content: conversation.to_string(),
+        created_at: now,
+        accessed_at: now,
+        access_count: 0,
+        salience: 1.0,
+        confidence: 1.0,
+        space_id,
+        attributes: std::collections::HashMap::new(),
+        tags: vec!["source:ingest".to_string(), "conversation".to_string()],
+        valid_from: None,
+        valid_until: None,
+    };
+    db.store(source_node).map_err(|e| {
+        error!("source memory store failed: {e}");
+        ApiError::Internal(format!("source memory store failed: {e}"))
+    })?;
+
+    let extraction_report = db
+        .store_extraction_result(
+            source_id,
+            &durable_result,
+            mentedb::ExtractionStoreOptions {
+                model: Some(config.model.clone()),
+                conversation_id,
+                ..Default::default()
+            },
+        )
+        .map_err(|e| {
+            error!("durable extraction persist failed: {e}");
+            ApiError::Internal(format!("durable extraction persist failed: {e}"))
+        })?;
 
     let mut stored_ids = Vec::new();
     for memory in &quality_passed {
@@ -476,7 +530,12 @@ async fn run_extraction(
     }
 
     Ok(json!({
+        "source_memory_id": source_id.to_string(),
+        "extraction_run_id": extraction_report.run_id,
         "memories_stored": stored_ids.len(),
+        "entities_persisted": extraction_report.entities,
+        "claims_persisted": extraction_report.claims,
+        "relationships_persisted": extraction_report.relationships,
         "rejected_low_quality": rejected_low_quality,
         "rejected_duplicate": 0,
         "contradictions": 0,

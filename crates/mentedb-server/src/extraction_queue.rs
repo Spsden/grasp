@@ -20,6 +20,7 @@ const MAX_CONCURRENT: usize = 4;
 pub struct ExtractionRequest {
     pub config: ExtractionConfig,
     pub content: String,
+    pub source_memory_id: mentedb_core::types::MemoryId,
     pub agent_id: AgentId,
     pub space_id: SpaceId,
     pub db: Arc<mentedb::MenteDb>,
@@ -61,18 +62,31 @@ async fn worker_loop(mut rx: ExtractionReceiver) {
 async fn process_extraction(req: ExtractionRequest) -> Result<(), String> {
     use mentedb_core::MemoryNode;
     use mentedb_core::types::MemoryId;
+    use mentedb_extraction::schema::ExtractionResult;
     use mentedb_extraction::{ExtractionPipeline, HttpExtractionProvider};
 
-    let provider = HttpExtractionProvider::new(req.config.clone())
+    let config = req.config.clone();
+    let provider = HttpExtractionProvider::new(config.clone())
         .map_err(|e| format!("extraction provider init: {e}"))?;
-    let pipeline = ExtractionPipeline::new(provider, req.config);
+    let pipeline = ExtractionPipeline::new(provider, config.clone());
 
-    let all_memories = pipeline
-        .extract_from_conversation(&req.content)
+    let full_result = pipeline
+        .extract_full(&req.content)
         .await
         .map_err(|e| format!("extraction failed: {e}"))?;
 
+    let all_memories = full_result.memories;
     let quality_passed = pipeline.filter_quality(&all_memories);
+    let relationships = full_result
+        .relationships
+        .into_iter()
+        .filter(|relationship| relationship.confidence >= config.quality_threshold)
+        .collect();
+    let durable_result = ExtractionResult {
+        memories: quality_passed.clone(),
+        entities: full_result.entities,
+        relationships,
+    };
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -109,10 +123,22 @@ async fn process_extraction(req: ExtractionRequest) -> Result<(), String> {
         }
     }
 
+    let options = mentedb::ExtractionStoreOptions {
+        model: Some(config.model.clone()),
+        ..Default::default()
+    };
+    let report = req
+        .db
+        .store_extraction_result(req.source_memory_id, &durable_result, options)
+        .map_err(|e| format!("durable extraction persist failed: {e}"))?;
+
     tracing::debug!(
         total = all_memories.len(),
         quality = quality_passed.len(),
         stored,
+        run_id = %report.run_id,
+        claims = report.claims,
+        relationships = report.relationships,
         "extraction complete"
     );
     Ok(())

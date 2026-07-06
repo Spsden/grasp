@@ -473,6 +473,19 @@ impl RelationshipEvidence {
     }
 }
 
+/// Borrowed extraction artifact bundle persisted in one transaction.
+pub struct ExtractionArtifacts<'a> {
+    pub run: &'a ExtractionRun,
+    pub entities: &'a [EntityRecord],
+    pub entity_aliases: &'a [EntityAlias],
+    pub memory_entities: &'a [MemoryEntityLink],
+    pub claims: &'a [ClaimRecord],
+    pub claim_entities: &'a [ClaimEntityLink],
+    pub claim_evidence: &'a [ClaimEvidence],
+    pub relationships: &'a [EntityRelationship],
+    pub relationship_evidence: &'a [RelationshipEvidence],
+}
+
 /// Map any error into `MenteError::Storage` with a human-readable message.
 /// We cannot `impl From<rusqlite::Error> for MenteError` here (both are foreign
 /// types, blocked by the orphan rule), so callers use `.map_err(store_err)?`.
@@ -2934,44 +2947,51 @@ impl Backend {
     /// Persist one extraction run and all derived artifacts in one transaction.
     pub fn persist_extraction_artifacts(
         &self,
-        run: &ExtractionRun,
-        claims: &[ClaimRecord],
-        claim_entities: &[ClaimEntityLink],
-        claim_evidence: &[ClaimEvidence],
-        relationships: &[EntityRelationship],
-        relationship_evidence: &[RelationshipEvidence],
+        artifacts: ExtractionArtifacts<'_>,
     ) -> Result<(), MenteError> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction().map_err(store_err)?;
-        Self::upsert_extraction_run_on(&tx, run)?;
-        for claim in claims {
+        Self::upsert_extraction_run_on(&tx, artifacts.run)?;
+        for entity in artifacts.entities {
+            Self::upsert_entity_on(&tx, entity)?;
+        }
+        for alias in artifacts.entity_aliases {
+            Self::add_entity_alias_on(&tx, alias)?;
+        }
+        for link in artifacts.memory_entities {
+            Self::link_memory_entity_on(&tx, link)?;
+        }
+        for claim in artifacts.claims {
             Self::upsert_claim_on(&tx, claim)?;
         }
-        for link in claim_entities {
+        for link in artifacts.claim_entities {
             Self::link_claim_entity_on(&tx, link)?;
         }
-        for evidence in claim_evidence {
+        for evidence in artifacts.claim_evidence {
             Self::add_claim_evidence_on(&tx, evidence)?;
         }
-        for relationship in relationships {
+        for relationship in artifacts.relationships {
             Self::upsert_entity_relationship_on(&tx, relationship)?;
         }
-        for evidence in relationship_evidence {
+        for evidence in artifacts.relationship_evidence {
             Self::add_relationship_evidence_on(&tx, evidence)?;
         }
         Self::record_operation_on(
             &tx,
             "extraction_artifacts_persist",
-            run.source_memory_id,
+            artifacts.run.source_memory_id,
             None,
             None,
             json!({
-                "run_id": run.run_id,
-                "claim_count": claims.len(),
-                "claim_entity_count": claim_entities.len(),
-                "claim_evidence_count": claim_evidence.len(),
-                "relationship_count": relationships.len(),
-                "relationship_evidence_count": relationship_evidence.len(),
+                "run_id": artifacts.run.run_id,
+                "entity_count": artifacts.entities.len(),
+                "entity_alias_count": artifacts.entity_aliases.len(),
+                "memory_entity_count": artifacts.memory_entities.len(),
+                "claim_count": artifacts.claims.len(),
+                "claim_entity_count": artifacts.claim_entities.len(),
+                "claim_evidence_count": artifacts.claim_evidence.len(),
+                "relationship_count": artifacts.relationships.len(),
+                "relationship_evidence_count": artifacts.relationship_evidence.len(),
             }),
         )?;
         tx.commit().map_err(store_err)
@@ -3339,7 +3359,7 @@ impl Backend {
 
         let mut stmt = conn.prepare(&sql).map_err(store_err)?;
         let rows = stmt
-            .query_map(rusqlite::params_from_iter(params_vec.into_iter()), |row| {
+            .query_map(rusqlite::params_from_iter(params_vec), |row| {
                 Ok(parse_id::<MemoryId>(&row.get::<_, String>(0)?)
                     .unwrap_or_else(|_| MemoryId::nil()))
             })
@@ -4058,7 +4078,7 @@ impl Backend {
         }
         let mut stmt = conn.prepare(&sql).map_err(store_err)?;
         let rows = stmt
-            .query_map(rusqlite::params_from_iter(params_vec.into_iter()), |row| {
+            .query_map(rusqlite::params_from_iter(params_vec), |row| {
                 Ok(parse_id::<MemoryId>(&row.get::<_, String>(0)?)
                     .unwrap_or_else(|_| MemoryId::nil()))
             })
@@ -4116,7 +4136,7 @@ impl Backend {
             .collect();
         let mut stmt = conn.prepare(&sql).map_err(store_err)?;
         let rows = stmt
-            .query_map(rusqlite::params_from_iter(params_vec.into_iter()), |row| {
+            .query_map(rusqlite::params_from_iter(params_vec), |row| {
                 let id = parse_id::<MemoryId>(&row.get::<_, String>(0)?)
                     .unwrap_or_else(|_| MemoryId::nil());
                 let emb: Vec<u8> = row.get(1)?;

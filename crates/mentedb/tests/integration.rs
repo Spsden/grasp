@@ -115,9 +115,6 @@ fn test_store_validated_extraction_persists_derived_claims() {
     let project_id = project.entity_id.clone();
     let tech = EntityRecord::new("technology", "Flutter");
     let tech_id = tech.entity_id.clone();
-    db.upsert_entity(person).unwrap();
-    db.upsert_entity(project).unwrap();
-    db.upsert_entity(tech).unwrap();
 
     let mut run = ExtractionRun::new("claim_extractor", "v1");
     run.source_memory_id = Some(memory_id);
@@ -141,6 +138,9 @@ fn test_store_validated_extraction_persists_derived_claims() {
 
     db.store_validated_extraction(ValidatedExtractionBatch {
         run,
+        entities: vec![person, project, tech],
+        entity_aliases: Vec::new(),
+        memory_entities: Vec::new(),
         claims: vec![claim],
         claim_entities: vec![
             ClaimEntityLink {
@@ -174,6 +174,78 @@ fn test_store_validated_extraction_persists_derived_claims() {
 }
 
 #[test]
+fn test_graph_claim_recall_uses_relationship_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = MenteDb::open(dir.path()).unwrap();
+
+    let source = make_memory(
+        "Project codename alpha stack detail was discussed.",
+        Vec::new(),
+    );
+    let source_id = source.id;
+    db.store(source).unwrap();
+
+    let project = EntityRecord::new("project", "Synapse");
+    let project_id = project.entity_id.clone();
+    let tech = EntityRecord::new("technology", "Flutter");
+    let tech_id = tech.entity_id.clone();
+
+    let mut run = ExtractionRun::new("claim_extractor", "v1");
+    run.source_memory_id = Some(source_id);
+    run.status = "completed".to_string();
+
+    let relationship = EntityRelationship::new(project_id.clone(), tech_id.clone(), "uses");
+    let relationship_id = relationship.relationship_id.clone();
+    let mut relationship_evidence = RelationshipEvidence::new(relationship_id, source_id);
+    relationship_evidence.evidence_text = Some("Synapse uses Flutter".to_string());
+
+    db.store_validated_extraction(ValidatedExtractionBatch {
+        run,
+        entities: vec![project, tech],
+        entity_aliases: vec![
+            EntityAlias {
+                entity_id: project_id,
+                alias: "synapse".to_string(),
+                source: Some("test".to_string()),
+                confidence: 1.0,
+            },
+            EntityAlias {
+                entity_id: tech_id,
+                alias: "flutter".to_string(),
+                source: Some("test".to_string()),
+                confidence: 1.0,
+            },
+        ],
+        memory_entities: Vec::new(),
+        claims: Vec::new(),
+        claim_entities: Vec::new(),
+        claim_evidence: Vec::new(),
+        relationships: vec![relationship],
+        relationship_evidence: vec![relationship_evidence],
+    })
+    .unwrap();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as u64;
+    let results = db
+        .recall_hybrid_at(
+            &[],
+            Some("what tech stack does synapse use"),
+            1,
+            now,
+            None,
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(results.first().map(|(id, _)| *id), Some(source_id));
+
+    db.close().unwrap();
+}
+
+#[test]
 fn test_store_validated_extraction_rejects_bad_artifacts() {
     let dir = tempfile::tempdir().unwrap();
     let db = MenteDb::open(dir.path()).unwrap();
@@ -184,6 +256,9 @@ fn test_store_validated_extraction_rejects_bad_artifacts() {
     let err = db
         .store_validated_extraction(ValidatedExtractionBatch {
             run,
+            entities: Vec::new(),
+            entity_aliases: Vec::new(),
+            memory_entities: Vec::new(),
             claims: Vec::new(),
             claim_entities: Vec::new(),
             claim_evidence: Vec::new(),
@@ -207,6 +282,12 @@ fn test_forget_memory() {
 
     db.store(node).unwrap();
     db.forget(id).unwrap();
+
+    let events = db.lifecycle_events_for_memory(id, 10).unwrap();
+    assert!(
+        events.iter().any(|event| event.event_type == "forgotten"),
+        "forget should leave a lifecycle audit event"
+    );
 
     // After forgetting, similarity search should not return the forgotten memory.
     let results = db.recall_similar(&[0.5, 0.5, 0.0, 0.0], 5).unwrap();

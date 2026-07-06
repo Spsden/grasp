@@ -71,6 +71,7 @@ use mentedb_graph::GraphManager;
 use mentedb_query::{Mql, QueryPlan};
 use mentedb_sqlite::Backend;
 use parking_lot::RwLock;
+use serde_json::json;
 use tracing::{debug, info, warn};
 
 // Re-export sub-crates for direct access.
@@ -94,9 +95,9 @@ pub use mentedb_query as query;
 pub use mentedb_sqlite as sqlite;
 pub use mentedb_sqlite::{
     ClaimEntityLink, ClaimEvidence, ClaimRecord, ConversationEvent, ConversationRecord,
-    EntityAlias, EntityRecord, EntityRelationship, ExtractionRun, MemoryEntityLink,
-    MemoryLifecycleEvent, MemoryOperation, MemorySource, RelationshipEvidence, RetrievalConfig,
-    RetrievalTrace, RetrievalTraceHit,
+    EntityAlias, EntityRecord, EntityRelationship, ExtractionArtifacts, ExtractionRun,
+    MemoryEntityLink, MemoryLifecycleEvent, MemoryOperation, MemorySource, RelationshipEvidence,
+    RetrievalConfig, RetrievalTrace, RetrievalTraceHit,
 };
 
 /// Renderer-neutral graph projection DTOs for app clients.
@@ -114,6 +115,8 @@ pub mod sleep;
 pub mod enrichment;
 
 pub use entity_extraction::{EntityExtractionConfig, ExtractedEntity as ExtractedMemoryEntity};
+#[cfg(feature = "extraction")]
+pub use extraction_jobs::{ExtractionStoreOptions, ExtractionStoreReport};
 pub use extraction_jobs::{ValidatedExtractionBatch, validate_extraction_batch};
 pub use graph_projection::{
     GraphProjection, GraphProjectionConfig, GraphProjectionEdge, GraphProjectionNode,
@@ -132,9 +135,9 @@ pub mod prelude {
     pub use mentedb_core::{MemoryEdge, MemoryNode, MemoryTier, MenteError};
     pub use mentedb_sqlite::{
         ClaimEntityLink, ClaimEvidence, ClaimRecord, ConversationEvent, ConversationRecord,
-        EntityAlias, EntityRecord, EntityRelationship, ExtractionRun, MemoryEntityLink,
-        MemoryLifecycleEvent, MemoryOperation, MemorySource, RelationshipEvidence, RetrievalConfig,
-        RetrievalTrace, RetrievalTraceHit,
+        EntityAlias, EntityRecord, EntityRelationship, ExtractionArtifacts, ExtractionRun,
+        MemoryEntityLink, MemoryLifecycleEvent, MemoryOperation, MemorySource,
+        RelationshipEvidence, RetrievalConfig, RetrievalTrace, RetrievalTraceHit,
     };
 
     pub use crate::MenteDb;
@@ -804,7 +807,9 @@ impl MenteDb {
             k * 3,
         )?;
         let mut scored: HashMap<MemoryId, f32> = results.into_iter().collect();
-        for (id, boost) in self.entity_recall_candidates(query_text, tags, tags_or, time_range)? {
+        for (id, boost) in
+            self.entity_recall_candidates(query_text, at, tags, tags_or, time_range)?
+        {
             scored
                 .entry(id)
                 .and_modify(|score| *score += boost)
@@ -838,6 +843,7 @@ impl MenteDb {
     fn entity_recall_candidates(
         &self,
         query_text: Option<&str>,
+        at: Timestamp,
         tags: Option<&[&str]>,
         tags_or: bool,
         time_range: Option<(Timestamp, Timestamp)>,
@@ -879,24 +885,138 @@ impl MenteDb {
             for entity in entities {
                 let links = self.db.memories_for_entity(&entity.entity_id)?;
                 for link in links.into_iter().take(config.recall_fetch_limit) {
-                    let Some(memory) = self.db.get_memory(link.memory_id)? else {
-                        continue;
-                    };
-                    if !memory_matches_tags(&memory, tags, tags_or)
-                        || !memory_matches_time_range(&memory, time_range)
-                    {
+                    let boost = config.recall_boost * alias_confidence * link.confidence.max(0.0);
+                    self.add_recall_candidate(
+                        &mut scored,
+                        link.memory_id,
+                        boost,
+                        tags,
+                        tags_or,
+                        time_range,
+                    )?;
+                }
+
+                for claim in self
+                    .db
+                    .claims_for_entity(&entity.entity_id)?
+                    .into_iter()
+                    .take(config.recall_fetch_limit)
+                {
+                    if !derived_artifact_valid(
+                        &claim.status,
+                        claim.valid_from,
+                        claim.valid_until,
+                        at,
+                    ) {
                         continue;
                     }
-                    let boost = config.recall_boost * alias_confidence * link.confidence.max(0.0);
-                    scored
-                        .entry(link.memory_id)
-                        .and_modify(|score| *score = score.max(boost))
-                        .or_insert(boost);
+                    let claim_boost =
+                        config.recall_boost * alias_confidence * claim.confidence.max(0.0) * 0.9;
+                    for evidence in self
+                        .db
+                        .claim_evidence(&claim.claim_id)?
+                        .into_iter()
+                        .take(config.recall_fetch_limit)
+                    {
+                        self.add_recall_candidate(
+                            &mut scored,
+                            evidence.memory_id,
+                            claim_boost * evidence.confidence.max(0.0),
+                            tags,
+                            tags_or,
+                            time_range,
+                        )?;
+                    }
+                }
+
+                for relationship in self
+                    .db
+                    .relationships_for_entity(&entity.entity_id)?
+                    .into_iter()
+                    .take(config.recall_fetch_limit)
+                {
+                    if !derived_artifact_valid(
+                        &relationship.status,
+                        relationship.valid_from,
+                        relationship.valid_until,
+                        at,
+                    ) {
+                        continue;
+                    }
+                    let relationship_boost =
+                        config.recall_boost * alias_confidence * relationship.confidence.max(0.0);
+                    for evidence in self
+                        .db
+                        .relationship_evidence(&relationship.relationship_id)?
+                        .into_iter()
+                        .take(config.recall_fetch_limit)
+                    {
+                        self.add_recall_candidate(
+                            &mut scored,
+                            evidence.memory_id,
+                            relationship_boost * evidence.confidence.max(0.0),
+                            tags,
+                            tags_or,
+                            time_range,
+                        )?;
+                    }
+
+                    let related_entity_id = if relationship.source_entity_id == entity.entity_id {
+                        Some(&relationship.target_entity_id)
+                    } else if relationship.target_entity_id == entity.entity_id {
+                        Some(&relationship.source_entity_id)
+                    } else {
+                        None
+                    };
+                    if let Some(related_entity_id) = related_entity_id {
+                        for link in self
+                            .db
+                            .memories_for_entity(related_entity_id)?
+                            .into_iter()
+                            .take(config.recall_fetch_limit)
+                        {
+                            self.add_recall_candidate(
+                                &mut scored,
+                                link.memory_id,
+                                relationship_boost * link.confidence.max(0.0) * 0.6,
+                                tags,
+                                tags_or,
+                                time_range,
+                            )?;
+                        }
+                    }
                 }
             }
         }
 
         Ok(scored.into_iter().collect())
+    }
+
+    fn add_recall_candidate(
+        &self,
+        scored: &mut HashMap<MemoryId, f32>,
+        memory_id: MemoryId,
+        boost: f32,
+        tags: Option<&[&str]>,
+        tags_or: bool,
+        time_range: Option<(Timestamp, Timestamp)>,
+    ) -> MenteResult<()> {
+        if boost <= 0.0 || !boost.is_finite() {
+            return Ok(());
+        }
+        let Some(memory) = self.db.get_memory(memory_id)? else {
+            return Ok(());
+        };
+        if !memory_matches_tags(&memory, tags, tags_or)
+            || !memory_matches_time_range(&memory, time_range)
+        {
+            return Ok(());
+        }
+        scored
+            .entry(memory_id)
+            .and_modify(|score| *score = score.max(boost))
+            .or_insert(boost);
+        Ok(())
     }
 
     /// Multi-query search with Reciprocal Rank Fusion (RRF).
@@ -974,8 +1094,19 @@ impl MenteDb {
             .db
             .get_memory(id)?
             .ok_or(MenteError::MemoryNotFound(id))?;
+        let previous_valid_until = node.valid_until;
         node.invalidate(at);
         self.db.store_memory(&node)?;
+        self.emit_lifecycle_event(
+            id,
+            "invalidated",
+            Some("valid_until_set"),
+            Some("temporal_invalidation"),
+            json!({
+                "valid_until": at,
+                "previous_valid_until": previous_valid_until,
+            }),
+        )?;
         Ok(())
     }
 
@@ -1056,14 +1187,17 @@ impl MenteDb {
     /// Validate and persist derived extraction artifacts in one transaction.
     pub fn store_validated_extraction(&self, batch: ValidatedExtractionBatch) -> MenteResult<()> {
         validate_extraction_batch(&batch)?;
-        self.db.persist_extraction_artifacts(
-            &batch.run,
-            &batch.claims,
-            &batch.claim_entities,
-            &batch.claim_evidence,
-            &batch.relationships,
-            &batch.relationship_evidence,
-        )
+        self.db.persist_extraction_artifacts(ExtractionArtifacts {
+            run: &batch.run,
+            entities: &batch.entities,
+            entity_aliases: &batch.entity_aliases,
+            memory_entities: &batch.memory_entities,
+            claims: &batch.claims,
+            claim_entities: &batch.claim_entities,
+            claim_evidence: &batch.claim_evidence,
+            relationships: &batch.relationships,
+            relationship_evidence: &batch.relationship_evidence,
+        })
     }
 
     /// Add or update a canonical entity.
@@ -1186,6 +1320,21 @@ impl MenteDb {
         self.db.record_lifecycle_event(&event)
     }
 
+    fn emit_lifecycle_event(
+        &self,
+        memory_id: MemoryId,
+        event_type: &str,
+        reason: Option<&str>,
+        policy: Option<&str>,
+        payload: serde_json::Value,
+    ) -> MenteResult<()> {
+        let mut event = MemoryLifecycleEvent::new(memory_id, event_type);
+        event.reason = reason.map(ToString::to_string);
+        event.policy = policy.map(ToString::to_string);
+        event.payload_json = payload.to_string();
+        self.record_lifecycle_event(event)
+    }
+
     /// Lifecycle events for one memory, newest first.
     pub fn lifecycle_events_for_memory(
         &self,
@@ -1214,8 +1363,17 @@ impl MenteDb {
     /// drops it from the in-memory graph.
     pub fn forget(&self, id: MemoryId) -> MenteResult<()> {
         debug!("Forgetting memory {}", id);
-        let _ = self.db.delete_memory(id)?;
+        let deleted = self.db.delete_memory(id)?;
         self.graph.remove_memory(id);
+        if deleted {
+            self.emit_lifecycle_event(
+                id,
+                "forgotten",
+                Some("memory_deleted"),
+                Some("forget"),
+                json!({ "deleted": true }),
+            )?;
+        }
         Ok(())
     }
 
@@ -1346,6 +1504,16 @@ impl MenteDb {
                     label: None,
                 };
                 self.relate(edge)?;
+                self.emit_lifecycle_event(
+                    memory,
+                    "corrected",
+                    Some("superseded_by_new_memory"),
+                    Some("write_inference"),
+                    json!({
+                        "superseded_by": superseded_by.to_string(),
+                        "valid_until": valid_until,
+                    }),
+                )?;
             }
             InferredAction::MarkObsolete {
                 memory,
@@ -1371,6 +1539,16 @@ impl MenteDb {
                     label: None,
                 };
                 self.relate(edge)?;
+                self.emit_lifecycle_event(
+                    memory,
+                    "deduplicated",
+                    Some("marked_obsolete_by_similar_memory"),
+                    Some("write_inference"),
+                    json!({
+                        "superseded_by": superseded_by.to_string(),
+                        "valid_until": now,
+                    }),
+                )?;
             }
             InferredAction::FlagContradiction {
                 existing,
@@ -1393,9 +1571,19 @@ impl MenteDb {
                     created_at: now,
                     valid_from: None,
                     valid_until: None,
-                    label: Some(reason),
+                    label: Some(reason.clone()),
                 };
                 self.relate(edge)?;
+                self.emit_lifecycle_event(
+                    existing,
+                    "contradicted",
+                    Some("contradiction_edge_created"),
+                    Some("write_inference"),
+                    json!({
+                        "contradicted_by": new.to_string(),
+                        "reason": reason,
+                    }),
+                )?;
             }
             InferredAction::UpdateConfidence {
                 memory,
@@ -1403,8 +1591,19 @@ impl MenteDb {
             } => {
                 debug!("Updating confidence for {} to {}", memory, new_confidence);
                 if let Ok(mut node) = self.get_memory(memory) {
+                    let previous_confidence = node.confidence;
                     node.confidence = new_confidence;
                     self.db.store_memory(&node)?;
+                    self.emit_lifecycle_event(
+                        memory,
+                        "confidence_updated",
+                        Some("write_inference_confidence_update"),
+                        Some("write_inference"),
+                        json!({
+                            "previous_confidence": previous_confidence,
+                            "new_confidence": new_confidence,
+                        }),
+                    )?;
                 }
             }
             InferredAction::PropagateBeliefChange { root, delta } => {
@@ -1414,8 +1613,21 @@ impl MenteDb {
                     let affected = self.graph.propagate_belief_change(root, new_confidence);
                     for (affected_id, new_conf) in affected {
                         if let Ok(mut affected_node) = self.get_memory(affected_id) {
+                            let previous_confidence = affected_node.confidence;
                             affected_node.confidence = new_conf;
-                            let _ = self.db.store_memory(&affected_node);
+                            self.db.store_memory(&affected_node)?;
+                            self.emit_lifecycle_event(
+                                affected_id,
+                                "confidence_updated",
+                                Some("belief_change_propagated"),
+                                Some("write_inference"),
+                                json!({
+                                    "root": root.to_string(),
+                                    "delta": delta,
+                                    "previous_confidence": previous_confidence,
+                                    "new_confidence": new_conf,
+                                }),
+                            )?;
                         }
                     }
                 }
@@ -1427,10 +1639,21 @@ impl MenteDb {
             } => {
                 debug!("Updating content of {}: {}", memory, reason);
                 if let Ok(mut node) = self.get_memory(memory) {
+                    let previous_content = node.content.clone();
                     node.content = new_content;
                     // The db upsert refreshes the FTS5 mirror (via trigger) and
                     // the vec0 row, so no separate index call is needed.
                     self.db.store_memory(&node)?;
+                    self.emit_lifecycle_event(
+                        memory,
+                        "corrected",
+                        Some(&reason),
+                        Some("write_inference"),
+                        json!({
+                            "previous_content": previous_content,
+                            "new_content": node.content,
+                        }),
+                    )?;
                 }
             }
         }
@@ -1490,8 +1713,20 @@ impl MenteDb {
                     now,
                 );
                 if (new_salience - node.salience).abs() > 0.001 {
+                    let previous_salience = node.salience;
                     node.salience = new_salience;
                     self.db.store_memory(&node)?;
+                    self.emit_lifecycle_event(
+                        id,
+                        "decayed",
+                        Some("salience_decay_applied"),
+                        Some("decay_global"),
+                        json!({
+                            "previous_salience": previous_salience,
+                            "new_salience": new_salience,
+                            "applied_at": now,
+                        }),
+                    )?;
                     updated += 1;
                 }
             }
@@ -1567,6 +1802,21 @@ impl MenteDb {
 
         let consolidated_id = consolidated.id;
         self.store(consolidated)?;
+        let source_ids: Vec<String> = result
+            .source_memories
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        self.emit_lifecycle_event(
+            consolidated_id,
+            "consolidated",
+            Some("consolidated_memory_created"),
+            Some("consolidation"),
+            json!({
+                "source_memories": source_ids,
+                "source_count": result.source_memories.len(),
+            }),
+        )?;
 
         // Invalidate source memories and create Derived edges.
         let now = std::time::SystemTime::now()
@@ -1586,6 +1836,16 @@ impl MenteDb {
                 label: None,
             };
             let _ = self.relate(edge);
+            let _ = self.emit_lifecycle_event(
+                *source_id,
+                "consolidated",
+                Some("merged_into_consolidated_memory"),
+                Some("consolidation"),
+                json!({
+                    "consolidated_memory": consolidated_id.to_string(),
+                    "valid_until": now,
+                }),
+            );
         }
 
         info!(
@@ -2786,6 +3046,22 @@ fn memory_matches_time_range(
         Some((start, end)) => node.created_at >= start && node.created_at <= end,
         None => true,
     }
+}
+
+fn derived_artifact_valid(
+    status: &str,
+    valid_from: Option<Timestamp>,
+    valid_until: Option<Timestamp>,
+    at: Timestamp,
+) -> bool {
+    if status != "active" {
+        return false;
+    }
+    let from = valid_from.unwrap_or(0);
+    if at < from {
+        return false;
+    }
+    valid_until.map(|until| at < until).unwrap_or(true)
 }
 
 fn query_aliases(query: &str, config: &EntityExtractionConfig) -> Vec<String> {
