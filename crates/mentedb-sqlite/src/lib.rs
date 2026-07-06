@@ -3,18 +3,13 @@
 //! This crate replaces the bespoke page/WAL/HNSW/CSR storage engine with a
 //! single SQLite database file:
 //!
-//!   * `memories`    — one row per `MemoryNode`, with ordinary B-tree indexes
-//!                     on the columns used for filtering (`agent_id`, `space_id`,
-//!                     `memory_type`, `salience`, `created_at`).
-//!   * `memory_tags` — a junction table replacing the roaring-bitmap tag index
-//!                     (`WHERE tag IN (...)`).
-//!   * `memory_vec`  — a `sqlite-vec` `vec0` virtual table for brute-force
-//!                     exact KNN over embeddings. It is a *derived* index: the
-//!                     source-of-truth bytes live in `memories.embedding`, and
-//!                     the vec0 table is keyed by the implicit `memories.rowid`
-//!                     so it can always be rebuilt from the source rows.
-//!   * `schema_meta` — key/value row holding the schema version and the
-//!                     embedding dimension the vec0 table was created with.
+//! * `memories` stores canonical memory rows with scalar indexes.
+//! * `memory_tags` stores tag memberships for deterministic filtering.
+//! * `memory_vec` stores a rebuildable sqlite-vec projection.
+//! * `edges` stores graph relationships as durable rows.
+//! * `memory_operations` stores the write audit trail.
+//! * `retrieval_traces` and `retrieval_trace_hits` store optional recall traces.
+//! * `schema_meta` stores schema version and projection metadata.
 //!
 //! All access goes through a single `parking_lot::Mutex<Connection>`. SQLite's
 //! own WAL handles crash recovery; the custom WAL/page-manager/buffer-pool are
@@ -22,16 +17,186 @@
 //! `StorageEngine` + `IndexManager` + `GraphManager`.
 
 use std::collections::{HashMap, HashSet};
+use std::os::raw::c_char;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use mentedb_core::edge::EdgeType;
 use mentedb_core::error::MenteResult;
 use mentedb_core::memory::MemoryType;
 use mentedb_core::types::{AgentId, MemoryId, SpaceId, Timestamp};
 use mentedb_core::{MemoryEdge, MemoryNode, MenteError};
-use parking_lot::Mutex;
-use rusqlite::{params, Connection, OptionalExtension};
+use parking_lot::{Mutex, RwLock};
+use rusqlite::{Connection, OptionalExtension, params};
+use serde_json::json;
+use uuid::Uuid;
+
+const SCHEMA_VERSION: usize = 2;
+
+/// Tunable retrieval parameters.
+///
+/// These defaults match the original hybrid-search behavior, but keeping them
+/// in a config struct makes ranking experiments visible and repeatable.
+#[derive(Debug, Clone)]
+pub struct RetrievalConfig {
+    /// How many candidates to fetch before final filtering.
+    pub fetch_multiplier: usize,
+    /// RRF smoothing constant for vector and text rank fusion.
+    pub rrf_k: f32,
+    /// Weight applied to the fused rank score.
+    pub rrf_weight: f32,
+    /// Weight applied to stored salience.
+    pub salience_weight: f32,
+    /// Weight applied to the recency prior.
+    pub recency_weight: f32,
+    /// Fixed recency prior until a richer temporal prior is added.
+    pub recency_prior: f32,
+    /// RRF smoothing constant for multi-query recall.
+    pub multi_query_rrf_k: f32,
+    /// Maximum number of retrieval traces kept when tracing is enabled.
+    pub trace_retention_limit: usize,
+}
+
+impl Default for RetrievalConfig {
+    fn default() -> Self {
+        Self {
+            fetch_multiplier: 4,
+            rrf_k: 60.0,
+            rrf_weight: 0.7,
+            salience_weight: 0.05,
+            recency_weight: 0.02,
+            recency_prior: 0.5,
+            multi_query_rrf_k: 60.0,
+            trace_retention_limit: 200,
+        }
+    }
+}
+
+/// A stored retrieval trace header.
+#[derive(Debug, Clone)]
+pub struct RetrievalTrace {
+    pub trace_id: String,
+    pub query_text: Option<String>,
+    pub query_embedding_dim: usize,
+    pub k: usize,
+    pub fetch_k: usize,
+    pub tags: Vec<String>,
+    pub tags_or: bool,
+    pub time_range: Option<(Timestamp, Timestamp)>,
+    pub candidate_count: usize,
+    pub result_count: usize,
+    pub created_at: Timestamp,
+}
+
+/// One final ranked hit from a stored retrieval trace.
+#[derive(Debug, Clone)]
+pub struct RetrievalTraceHit {
+    pub trace_id: String,
+    pub rank: usize,
+    pub memory_id: MemoryId,
+    pub score: f32,
+    pub vector_rank: Option<usize>,
+    pub bm25_rank: Option<usize>,
+    pub salience: Option<f32>,
+}
+
+/// A write-side audit record.
+#[derive(Debug, Clone)]
+pub struct MemoryOperation {
+    pub operation_id: String,
+    pub operation_type: String,
+    pub memory_id: Option<MemoryId>,
+    pub source: Option<MemoryId>,
+    pub target: Option<MemoryId>,
+    pub payload_json: String,
+    pub created_at: Timestamp,
+}
+
+/// Provenance for why a memory exists.
+#[derive(Debug, Clone)]
+pub struct MemorySource {
+    pub source_id: String,
+    pub memory_id: MemoryId,
+    pub source_type: String,
+    pub conversation_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub actor_id: Option<String>,
+    pub observed_at: Option<Timestamp>,
+    pub extractor: Option<String>,
+    pub extractor_hash: Option<String>,
+    pub prompt_hash: Option<String>,
+    pub payload_json: String,
+    pub created_at: Timestamp,
+}
+
+impl MemorySource {
+    /// Create a source record with a generated source id.
+    pub fn new(memory_id: MemoryId, source_type: impl Into<String>) -> Self {
+        let now = now_us();
+        Self {
+            source_id: Uuid::new_v4().to_string(),
+            memory_id,
+            source_type: source_type.into(),
+            conversation_id: None,
+            turn_id: None,
+            actor_id: None,
+            observed_at: None,
+            extractor: None,
+            extractor_hash: None,
+            prompt_hash: None,
+            payload_json: "{}".to_string(),
+            created_at: now,
+        }
+    }
+}
+
+/// Canonical entity row used for deterministic graph and recall filters.
+#[derive(Debug, Clone)]
+pub struct EntityRecord {
+    pub entity_id: String,
+    pub entity_type: String,
+    pub canonical: String,
+    pub attributes_json: String,
+    pub confidence: f32,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+}
+
+impl EntityRecord {
+    /// Create an entity with a generated entity id.
+    pub fn new(entity_type: impl Into<String>, canonical: impl Into<String>) -> Self {
+        let now = now_us();
+        Self {
+            entity_id: Uuid::new_v4().to_string(),
+            entity_type: entity_type.into(),
+            canonical: canonical.into(),
+            attributes_json: "{}".to_string(),
+            confidence: 1.0,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+}
+
+/// Alias for a canonical entity.
+#[derive(Debug, Clone)]
+pub struct EntityAlias {
+    pub entity_id: String,
+    pub alias: String,
+    pub source: Option<String>,
+    pub confidence: f32,
+}
+
+/// Link between a memory and an entity.
+#[derive(Debug, Clone)]
+pub struct MemoryEntityLink {
+    pub memory_id: MemoryId,
+    pub entity_id: String,
+    pub role: Option<String>,
+    pub confidence: f32,
+    pub evidence: Option<String>,
+}
 
 /// Map any error into `MenteError::Storage` with a human-readable message.
 /// We cannot `impl From<rusqlite::Error> for MenteError` here (both are foreign
@@ -48,7 +213,7 @@ fn store_err<E: std::fmt::Display>(e: E) -> MenteError {
 /// connection opened *after* this call. Guarded by `Once` so repeated opens are
 /// no-ops. Must run before any `Connection::open*` in this backend.
 fn ensure_vec0_registered() {
-    use rusqlite::ffi::sqlite3_auto_extension;
+    use rusqlite::ffi::{sqlite3, sqlite3_api_routines, sqlite3_auto_extension};
     use std::sync::Once;
     static REGISTER: Once = Once::new();
     REGISTER.call_once(|| {
@@ -56,9 +221,15 @@ fn ensure_vec0_registered() {
         // sqlite-vec extension and has the `sqlite3_loadext_entry` signature
         // SQLite expects. The transmute mirrors the crate's own test.
         unsafe {
-            sqlite3_auto_extension(Some(std::mem::transmute(
+            type SqliteExtensionInit = unsafe extern "C" fn(
+                db: *mut sqlite3,
+                pz_err_msg: *mut *const c_char,
+                api: *const sqlite3_api_routines,
+            ) -> i32;
+            let init = std::mem::transmute::<*const (), SqliteExtensionInit>(
                 sqlite_vec::sqlite3_vec_init as *const (),
-            )));
+            );
+            sqlite3_auto_extension(Some(init));
         }
     });
 }
@@ -172,6 +343,44 @@ where
     s.parse::<I>().map_err(store_err)
 }
 
+fn parse_optional_memory_id(value: Option<String>) -> Option<MemoryId> {
+    value.and_then(|s| parse_id::<MemoryId>(&s).ok())
+}
+
+fn now_us() -> Timestamp {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as Timestamp
+}
+
+fn usize_to_i64(value: usize) -> Result<i64, MenteError> {
+    i64::try_from(value).map_err(store_err)
+}
+
+fn tags_json(tags: Option<&[&str]>) -> Result<String, MenteError> {
+    let tags: Vec<&str> = tags.unwrap_or_default().to_vec();
+    serde_json::to_string(&tags).map_err(store_err)
+}
+
+fn parse_tags_json(value: &str) -> Vec<String> {
+    serde_json::from_str(value).unwrap_or_default()
+}
+
+fn retrieval_config_json(config: &RetrievalConfig) -> Result<String, MenteError> {
+    serde_json::to_string(&json!({
+        "fetch_multiplier": config.fetch_multiplier,
+        "rrf_k": config.rrf_k,
+        "rrf_weight": config.rrf_weight,
+        "salience_weight": config.salience_weight,
+        "recency_weight": config.recency_weight,
+        "recency_prior": config.recency_prior,
+        "multi_query_rrf_k": config.multi_query_rrf_k,
+        "trace_retention_limit": config.trace_retention_limit,
+    }))
+    .map_err(store_err)
+}
+
 // ---------------------------------------------------------------------------
 // Backend
 // ---------------------------------------------------------------------------
@@ -183,6 +392,8 @@ where
 /// `sqlite-vec` extension loaded for the lifetime of the backend.
 pub struct Backend {
     conn: Mutex<Connection>,
+    retrieval_config: RwLock<RetrievalConfig>,
+    trace_retrieval: AtomicBool,
     /// The dimension the `memory_vec` vec0 table was created with, or `0` when
     /// no vector index exists yet (deferred until an embedder is configured).
     /// Atomic because [`Backend::ensure_vector_index`] mutates it through
@@ -193,31 +404,57 @@ pub struct Backend {
 impl Backend {
     /// Open (or create) a file-backed database at `path`.
     pub fn open(path: &Path, embedding_dim: usize) -> Result<Self, MenteError> {
+        Self::open_with_retrieval_config(path, embedding_dim, RetrievalConfig::default())
+    }
+
+    /// Open with explicit retrieval configuration.
+    pub fn open_with_retrieval_config(
+        path: &Path,
+        embedding_dim: usize,
+        retrieval_config: RetrievalConfig,
+    ) -> Result<Self, MenteError> {
         // Ensure the parent directory exists so a fresh path works.
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(store_err)?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(store_err)?;
         }
         ensure_vec0_registered();
         let mut conn = Connection::open(path).map_err(store_err)?;
         // WAL: concurrent readers don't block the writer, and crash recovery is
         // handled by SQLite instead of the old custom WAL.
-        conn.pragma_update(None, "journal_mode", "WAL").map_err(store_err)?;
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(store_err)?;
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .map_err(store_err)?;
         let effective = Self::init(&mut conn, embedding_dim)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            retrieval_config: RwLock::new(retrieval_config),
+            trace_retrieval: AtomicBool::new(false),
             embedding_dim: AtomicUsize::new(effective),
         })
     }
 
     /// Open an ephemeral in-memory database (used by tests and quick spikes).
     pub fn open_in_memory(embedding_dim: usize) -> Result<Self, MenteError> {
+        Self::open_in_memory_with_retrieval_config(embedding_dim, RetrievalConfig::default())
+    }
+
+    /// Open an ephemeral database with explicit retrieval configuration.
+    pub fn open_in_memory_with_retrieval_config(
+        embedding_dim: usize,
+        retrieval_config: RetrievalConfig,
+    ) -> Result<Self, MenteError> {
         ensure_vec0_registered();
         let mut conn = Connection::open_in_memory().map_err(store_err)?;
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .map_err(store_err)?;
         let effective = Self::init(&mut conn, embedding_dim)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            retrieval_config: RwLock::new(retrieval_config),
+            trace_retrieval: AtomicBool::new(false),
             embedding_dim: AtomicUsize::new(effective),
         })
     }
@@ -225,6 +462,26 @@ impl Backend {
     /// The dimension the vector index was created with (0 = deferred / absent).
     pub fn embedding_dim(&self) -> usize {
         self.embedding_dim.load(Ordering::Relaxed)
+    }
+
+    /// Current retrieval tuning used by hybrid and multi-query search.
+    pub fn retrieval_config(&self) -> RetrievalConfig {
+        self.retrieval_config.read().clone()
+    }
+
+    /// Replace retrieval tuning for future searches.
+    pub fn set_retrieval_config(&self, config: RetrievalConfig) {
+        *self.retrieval_config.write() = config;
+    }
+
+    /// Enable or disable persisted retrieval traces.
+    pub fn set_retrieval_tracing(&self, enabled: bool) {
+        self.trace_retrieval.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Whether retrieval traces are persisted for future searches.
+    pub fn retrieval_tracing_enabled(&self) -> bool {
+        self.trace_retrieval.load(Ordering::Relaxed)
     }
 
     /// Create (or recreate) the vec0 vector index at `dim` and backfill it from
@@ -235,46 +492,66 @@ impl Backend {
         if dim == 0 || dim == self.embedding_dim.load(Ordering::Relaxed) {
             return Ok(());
         }
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(store_err)?;
         // Drop any existing vec0 table (possibly at a different dim) and
         // recreate at the requested dimension.
-        let _ = conn.execute("DROP TABLE IF EXISTS memory_vec", []);
-        conn.execute(
+        let _ = tx.execute("DROP TABLE IF EXISTS memory_vec", []);
+        tx.execute(
             &format!("CREATE VIRTUAL TABLE memory_vec USING vec0(embedding float[{dim}])"),
             [],
         )
         .map_err(store_err)?;
 
         // Backfill from stored embeddings (normalized).
-        let mut select = conn
-            .prepare("SELECT rowid, embedding FROM memories WHERE embedding IS NOT NULL")
-            .map_err(store_err)?;
-        let rows = select
-            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))
-            .map_err(store_err)?;
-        let mut pairs: Vec<(i64, Vec<u8>)> = Vec::new();
-        for row in rows {
-            pairs.push(row.map_err(store_err)?);
-        }
-        drop(select);
+        let pairs: Vec<(i64, Vec<u8>)> = {
+            let mut select = tx
+                .prepare("SELECT rowid, embedding FROM memories WHERE embedding IS NOT NULL")
+                .map_err(store_err)?;
+            let rows = select
+                .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))
+                .map_err(store_err)?;
+            let mut pairs = Vec::new();
+            for row in rows {
+                pairs.push(row.map_err(store_err)?);
+            }
+            pairs
+        };
+        let mut backfilled = 0usize;
+        let mut skipped = 0usize;
         for (rowid, bytes) in pairs {
             let emb = blob_to_embedding(&bytes);
             if emb.len() != dim {
-                continue; // skip rows that don't match the new dim
+                skipped += 1;
+                continue;
             }
             let norm = normalize(&emb);
             let blob = embedding_to_blob(&norm);
-            conn.execute(
+            tx.execute(
                 "INSERT INTO memory_vec (rowid, embedding) VALUES (?1, ?2)",
                 params![rowid, blob.as_slice()],
             )
             .map_err(store_err)?;
+            backfilled += 1;
         }
-        conn.execute(
+        tx.execute(
             "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('embedding_dim', ?1)",
             params![dim.to_string()],
         )
         .map_err(store_err)?;
+        Self::record_operation_on(
+            &tx,
+            "vector_index_rebuild",
+            None,
+            None,
+            None,
+            json!({
+                "embedding_dim": dim,
+                "backfilled": backfilled,
+                "skipped_dimension_mismatch": skipped,
+            }),
+        )?;
+        tx.commit().map_err(store_err)?;
 
         self.embedding_dim.store(dim, Ordering::Relaxed);
         Ok(())
@@ -283,7 +560,7 @@ impl Backend {
     /// Create all tables/indexes. `hint_dim` is used only on first creation; a
     /// stored `embedding_dim` in `schema_meta` wins on reopen so the vec0
     /// table survives across launches. Returns the effective dimension (0 means
-    /// "deferred — no vector index yet").
+    /// "deferred, no vector index yet").
     fn init(conn: &mut Connection, hint_dim: usize) -> Result<usize, MenteError> {
         // The vec0 module was registered process-globally by
         // `ensure_vec0_registered()` before this connection was opened, so the
@@ -359,17 +636,130 @@ impl Backend {
                 INSERT INTO memories_fts(memories_fts, rowid, content) VALUES('delete', old.rowid, old.content);
                 INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
             END;
+
+            CREATE TABLE IF NOT EXISTS memory_operations (
+                operation_id   TEXT PRIMARY KEY,
+                operation_type TEXT NOT NULL,
+                memory_id      TEXT,
+                source         TEXT,
+                target         TEXT,
+                payload_json   TEXT NOT NULL,
+                created_at     INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_operations_created
+                ON memory_operations(created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_memory_operations_memory
+                ON memory_operations(memory_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_memory_operations_edge
+                ON memory_operations(source, target, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS memory_sources (
+                source_id       TEXT PRIMARY KEY,
+                memory_id       TEXT NOT NULL,
+                source_type     TEXT NOT NULL,
+                conversation_id TEXT,
+                turn_id         TEXT,
+                actor_id        TEXT,
+                observed_at     INTEGER,
+                extractor       TEXT,
+                extractor_hash  TEXT,
+                prompt_hash     TEXT,
+                payload_json    TEXT NOT NULL DEFAULT '{}',
+                created_at      INTEGER NOT NULL,
+                FOREIGN KEY(memory_id) REFERENCES memories(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_sources_memory
+                ON memory_sources(memory_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_memory_sources_type
+                ON memory_sources(source_type, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_memory_sources_turn
+                ON memory_sources(conversation_id, turn_id);
+
+            CREATE TABLE IF NOT EXISTS entities (
+                entity_id       TEXT PRIMARY KEY,
+                entity_type     TEXT NOT NULL,
+                canonical       TEXT NOT NULL,
+                attributes_json TEXT NOT NULL DEFAULT '{}',
+                confidence      REAL NOT NULL DEFAULT 1.0,
+                created_at      INTEGER NOT NULL,
+                updated_at      INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_entities_type_canonical
+                ON entities(entity_type, canonical);
+            CREATE INDEX IF NOT EXISTS idx_entities_canonical
+                ON entities(canonical);
+
+            CREATE TABLE IF NOT EXISTS entity_aliases (
+                entity_id  TEXT NOT NULL,
+                alias      TEXT NOT NULL,
+                source     TEXT,
+                confidence REAL NOT NULL DEFAULT 1.0,
+                PRIMARY KEY(entity_id, alias),
+                FOREIGN KEY(entity_id) REFERENCES entities(entity_id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_entity_aliases_alias
+                ON entity_aliases(alias);
+
+            CREATE TABLE IF NOT EXISTS memory_entities (
+                memory_id  TEXT NOT NULL,
+                entity_id  TEXT NOT NULL,
+                role       TEXT NOT NULL DEFAULT '',
+                confidence REAL NOT NULL DEFAULT 1.0,
+                evidence   TEXT,
+                PRIMARY KEY(memory_id, entity_id, role),
+                FOREIGN KEY(memory_id) REFERENCES memories(id) ON DELETE CASCADE,
+                FOREIGN KEY(entity_id) REFERENCES entities(entity_id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_entities_entity
+                ON memory_entities(entity_id);
+            CREATE INDEX IF NOT EXISTS idx_memory_entities_memory
+                ON memory_entities(memory_id);
+
+            CREATE TABLE IF NOT EXISTS retrieval_traces (
+                trace_id            TEXT PRIMARY KEY,
+                query_text          TEXT,
+                query_embedding_dim INTEGER NOT NULL,
+                k                   INTEGER NOT NULL,
+                fetch_k             INTEGER NOT NULL,
+                tags_json           TEXT NOT NULL,
+                tags_or             INTEGER NOT NULL,
+                time_start          INTEGER,
+                time_end            INTEGER,
+                candidate_count     INTEGER NOT NULL,
+                result_count        INTEGER NOT NULL,
+                config_json         TEXT NOT NULL,
+                created_at          INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_retrieval_traces_created
+                ON retrieval_traces(created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS retrieval_trace_hits (
+                trace_id    TEXT NOT NULL,
+                rank        INTEGER NOT NULL,
+                memory_id   TEXT NOT NULL,
+                score       REAL NOT NULL,
+                vector_rank INTEGER,
+                bm25_rank   INTEGER,
+                salience    REAL,
+                PRIMARY KEY(trace_id, rank),
+                FOREIGN KEY(trace_id) REFERENCES retrieval_traces(trace_id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_retrieval_trace_hits_memory
+                ON retrieval_trace_hits(memory_id);
             "#,
         )
         .map_err(store_err)?;
 
         // Populate FTS from any pre-existing rows (no-op on a fresh open).
         // FTS5's 'rebuild' command rescans the external content table.
-        let _ = tx.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')", []);
+        let _ = tx.execute(
+            "INSERT INTO memories_fts(memories_fts) VALUES('rebuild')",
+            [],
+        );
 
         // Resolve the effective vector dimension: a previously-stored dim wins
         // (so the vec0 table survives reopen), otherwise fall back to the hint.
-        // `0` means "deferred" — no embedder configured yet, so no vec0 table
+        // `0` means "deferred", no embedder configured yet, so no vec0 table
         // is created until [`Backend::ensure_vector_index`] is called.
         let stored: Option<String> = tx
             .query_row(
@@ -393,6 +783,11 @@ impl Backend {
             .map_err(store_err)?;
         }
         tx.execute(
+            "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', ?1)",
+            params![SCHEMA_VERSION.to_string()],
+        )
+        .map_err(store_err)?;
+        tx.execute(
             "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('embedding_dim', ?1)",
             params![effective.to_string()],
         )
@@ -402,21 +797,225 @@ impl Backend {
         Ok(effective)
     }
 
-    /// Persist (or update) a memory and refresh its vector + tag rows.
-    ///
-    /// The original embedding is stored verbatim in `memories.embedding`
-    /// (returned unchanged by [`Self::get_memory`]); a normalized copy goes
-    /// into the `vec0` table so KNN behaves as cosine similarity.
-    pub fn store_memory(&self, node: &MemoryNode) -> Result<(), MenteError> {
-        let dim = self.embedding_dim.load(Ordering::Relaxed);
-        if !node.embedding.is_empty() && dim > 0 && node.embedding.len() != dim {
-            return Err(MenteError::EmbeddingDimensionMismatch {
-                got: node.embedding.len(),
-                expected: dim,
-            });
-        }
+    fn record_operation_on(
+        tx: &rusqlite::Transaction<'_>,
+        operation_type: &str,
+        memory_id: Option<MemoryId>,
+        source: Option<MemoryId>,
+        target: Option<MemoryId>,
+        payload: serde_json::Value,
+    ) -> Result<(), MenteError> {
+        let operation_id = Uuid::new_v4().to_string();
+        let memory_id = memory_id.map(|id| id.to_string());
+        let source = source.map(|id| id.to_string());
+        let target = target.map(|id| id.to_string());
+        let payload_json = serde_json::to_string(&payload).map_err(store_err)?;
+        tx.execute(
+            r#"
+            INSERT INTO memory_operations (
+                operation_id, operation_type, memory_id, source, target,
+                payload_json, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "#,
+            params![
+                operation_id,
+                operation_type,
+                memory_id.as_deref(),
+                source.as_deref(),
+                target.as_deref(),
+                payload_json,
+                now_us() as i64,
+            ],
+        )
+        .map_err(store_err)?;
+        Ok(())
+    }
 
-        let conn = self.conn.lock();
+    fn insert_memory_source_on(
+        tx: &rusqlite::Transaction<'_>,
+        source: &MemorySource,
+    ) -> Result<(), MenteError> {
+        tx.execute(
+            r#"
+            INSERT INTO memory_sources (
+                source_id, memory_id, source_type, conversation_id, turn_id,
+                actor_id, observed_at, extractor, extractor_hash, prompt_hash,
+                payload_json, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            ON CONFLICT(source_id) DO UPDATE SET
+                memory_id       = excluded.memory_id,
+                source_type     = excluded.source_type,
+                conversation_id = excluded.conversation_id,
+                turn_id         = excluded.turn_id,
+                actor_id        = excluded.actor_id,
+                observed_at     = excluded.observed_at,
+                extractor       = excluded.extractor,
+                extractor_hash  = excluded.extractor_hash,
+                prompt_hash     = excluded.prompt_hash,
+                payload_json    = excluded.payload_json,
+                created_at      = excluded.created_at
+            "#,
+            params![
+                source.source_id,
+                source.memory_id.to_string(),
+                source.source_type,
+                source.conversation_id.as_deref(),
+                source.turn_id.as_deref(),
+                source.actor_id.as_deref(),
+                source.observed_at.map(|t| t as i64),
+                source.extractor.as_deref(),
+                source.extractor_hash.as_deref(),
+                source.prompt_hash.as_deref(),
+                source.payload_json,
+                source.created_at as i64,
+            ],
+        )
+        .map_err(store_err)?;
+        Self::record_operation_on(
+            tx,
+            "memory_source_upsert",
+            Some(source.memory_id),
+            None,
+            None,
+            json!({
+                "source_id": source.source_id,
+                "source_type": source.source_type,
+                "conversation_id": source.conversation_id,
+                "turn_id": source.turn_id,
+                "actor_id": source.actor_id,
+                "observed_at": source.observed_at,
+                "extractor": source.extractor,
+                "extractor_hash": source.extractor_hash,
+                "prompt_hash": source.prompt_hash,
+            }),
+        )?;
+        Ok(())
+    }
+
+    fn upsert_entity_on(
+        tx: &rusqlite::Transaction<'_>,
+        entity: &EntityRecord,
+    ) -> Result<(), MenteError> {
+        tx.execute(
+            r#"
+            INSERT INTO entities (
+                entity_id, entity_type, canonical, attributes_json,
+                confidence, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(entity_id) DO UPDATE SET
+                entity_type     = excluded.entity_type,
+                canonical       = excluded.canonical,
+                attributes_json = excluded.attributes_json,
+                confidence      = excluded.confidence,
+                updated_at      = excluded.updated_at
+            "#,
+            params![
+                entity.entity_id,
+                entity.entity_type,
+                entity.canonical,
+                entity.attributes_json,
+                entity.confidence as f64,
+                entity.created_at as i64,
+                entity.updated_at as i64,
+            ],
+        )
+        .map_err(store_err)?;
+        Self::record_operation_on(
+            tx,
+            "entity_upsert",
+            None,
+            None,
+            None,
+            json!({
+                "entity_id": entity.entity_id,
+                "entity_type": entity.entity_type,
+                "canonical": entity.canonical,
+                "confidence": entity.confidence,
+            }),
+        )?;
+        Ok(())
+    }
+
+    fn add_entity_alias_on(
+        tx: &rusqlite::Transaction<'_>,
+        alias: &EntityAlias,
+    ) -> Result<(), MenteError> {
+        tx.execute(
+            r#"
+            INSERT INTO entity_aliases (entity_id, alias, source, confidence)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(entity_id, alias) DO UPDATE SET
+                source = excluded.source,
+                confidence = excluded.confidence
+            "#,
+            params![
+                alias.entity_id,
+                alias.alias,
+                alias.source.as_deref(),
+                alias.confidence as f64,
+            ],
+        )
+        .map_err(store_err)?;
+        Self::record_operation_on(
+            tx,
+            "entity_alias_upsert",
+            None,
+            None,
+            None,
+            json!({
+                "entity_id": alias.entity_id,
+                "alias": alias.alias,
+                "source": alias.source,
+                "confidence": alias.confidence,
+            }),
+        )?;
+        Ok(())
+    }
+
+    fn link_memory_entity_on(
+        tx: &rusqlite::Transaction<'_>,
+        link: &MemoryEntityLink,
+    ) -> Result<(), MenteError> {
+        let role = link.role.as_deref().unwrap_or("");
+        tx.execute(
+            r#"
+            INSERT INTO memory_entities (
+                memory_id, entity_id, role, confidence, evidence
+            ) VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(memory_id, entity_id, role) DO UPDATE SET
+                confidence = excluded.confidence,
+                evidence = excluded.evidence
+            "#,
+            params![
+                link.memory_id.to_string(),
+                link.entity_id,
+                role,
+                link.confidence as f64,
+                link.evidence.as_deref(),
+            ],
+        )
+        .map_err(store_err)?;
+        Self::record_operation_on(
+            tx,
+            "memory_entity_link_upsert",
+            Some(link.memory_id),
+            None,
+            None,
+            json!({
+                "entity_id": link.entity_id,
+                "role": link.role,
+                "confidence": link.confidence,
+                "evidence": link.evidence,
+            }),
+        )?;
+        Ok(())
+    }
+
+    fn store_memory_on(
+        tx: &rusqlite::Transaction<'_>,
+        node: &MemoryNode,
+        dim: usize,
+    ) -> Result<(), MenteError> {
         let attrs_json = serde_json::to_string(&node.attributes).map_err(store_err)?;
         let emb_blob = if node.embedding.is_empty() {
             None
@@ -428,7 +1027,7 @@ impl Backend {
 
         // Upsert the memory row. `ON CONFLICT(id) DO UPDATE` preserves the
         // implicit rowid, which keeps the vec0 key stable across re-stores.
-        conn.execute(
+        tx.execute(
             r#"
             INSERT INTO memories (
                 id, agent_id, space_id, memory_type, content, embedding,
@@ -472,23 +1071,18 @@ impl Backend {
 
         // Refresh the derived vector row. vec0 `REPLACE` semantics are version
         // dependent, so delete-then-insert is the portable choice.
-        let rowid: i64 = conn
+        let rowid: i64 = tx
             .query_row(
                 "SELECT rowid FROM memories WHERE id = ?1",
                 params![id_str],
                 |r| r.get(0),
             )
             .map_err(store_err)?;
-        let _ = conn.execute(
-            "DELETE FROM memory_vec WHERE rowid = ?1",
-            params![rowid],
-        );
+        let _ = tx.execute("DELETE FROM memory_vec WHERE rowid = ?1", params![rowid]);
         if dim > 0 && !node.embedding.is_empty() {
-            // Store a normalized copy so L2 KNN approximates cosine ranking.
             let norm = normalize(&node.embedding);
             let norm_blob = embedding_to_blob(&norm);
-            let _ = &emb_blob; // original bytes already stored in memories.embedding
-            conn.execute(
+            tx.execute(
                 "INSERT INTO memory_vec (rowid, embedding) VALUES (?1, ?2)",
                 params![rowid, norm_blob.as_slice()],
             )
@@ -496,20 +1090,353 @@ impl Backend {
         }
 
         // Refresh tags (delete + reinsert is simplest and correct).
-        conn.execute(
+        tx.execute(
             "DELETE FROM memory_tags WHERE memory_id = ?1",
             params![id_str],
         )
         .map_err(store_err)?;
         for tag in &node.tags {
-            conn.execute(
+            tx.execute(
                 "INSERT OR IGNORE INTO memory_tags (memory_id, tag) VALUES (?1, ?2)",
                 params![id_str, tag],
             )
             .map_err(store_err)?;
         }
 
+        Self::record_operation_on(
+            tx,
+            "memory_upsert",
+            Some(node.id),
+            None,
+            None,
+            json!({
+                "agent_id": node.agent_id.to_string(),
+                "space_id": node.space_id.to_string(),
+                "memory_type": memory_type_str(node.memory_type),
+                "content_len": node.content.len(),
+                "embedding_dim": node.embedding.len(),
+                "tag_count": node.tags.len(),
+                "valid_from": node.valid_from,
+                "valid_until": node.valid_until,
+            }),
+        )?;
+
         Ok(())
+    }
+
+    /// Persist (or update) a memory and refresh its vector + tag rows.
+    ///
+    /// The original embedding is stored verbatim in `memories.embedding`
+    /// (returned unchanged by [`Self::get_memory`]); a normalized copy goes
+    /// into the `vec0` table so KNN behaves as cosine similarity.
+    pub fn store_memory(&self, node: &MemoryNode) -> Result<(), MenteError> {
+        let dim = self.embedding_dim.load(Ordering::Relaxed);
+        if !node.embedding.is_empty() && dim > 0 && node.embedding.len() != dim {
+            return Err(MenteError::EmbeddingDimensionMismatch {
+                got: node.embedding.len(),
+                expected: dim,
+            });
+        }
+
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(store_err)?;
+        Self::store_memory_on(&tx, node, dim)?;
+        tx.commit().map_err(store_err)
+    }
+
+    /// Persist a memory and its provenance in one transaction.
+    pub fn store_memory_with_source(
+        &self,
+        node: &MemoryNode,
+        source: &MemorySource,
+    ) -> Result<(), MenteError> {
+        if source.memory_id != node.id {
+            return Err(MenteError::Storage(format!(
+                "memory source {} points at {}, expected {}",
+                source.source_id, source.memory_id, node.id
+            )));
+        }
+        let dim = self.embedding_dim.load(Ordering::Relaxed);
+        if !node.embedding.is_empty() && dim > 0 && node.embedding.len() != dim {
+            return Err(MenteError::EmbeddingDimensionMismatch {
+                got: node.embedding.len(),
+                expected: dim,
+            });
+        }
+
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(store_err)?;
+        Self::store_memory_on(&tx, node, dim)?;
+        Self::insert_memory_source_on(&tx, source)?;
+        tx.commit().map_err(store_err)
+    }
+
+    /// Add or update provenance for an existing memory.
+    pub fn add_memory_source(&self, source: &MemorySource) -> Result<(), MenteError> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(store_err)?;
+        Self::insert_memory_source_on(&tx, source)?;
+        tx.commit().map_err(store_err)
+    }
+
+    /// List provenance records for a memory, newest first.
+    pub fn memory_sources(&self, id: MemoryId) -> Result<Vec<MemorySource>, MenteError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT source_id, memory_id, source_type, conversation_id, turn_id,
+                       actor_id, observed_at, extractor, extractor_hash, prompt_hash,
+                       payload_json, created_at
+                FROM memory_sources
+                WHERE memory_id = ?1
+                ORDER BY created_at DESC
+                "#,
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![id.to_string()], |row| {
+                Ok(MemorySource {
+                    source_id: row.get(0)?,
+                    memory_id: parse_id::<MemoryId>(&row.get::<_, String>(1)?)
+                        .unwrap_or_else(|_| MemoryId::nil()),
+                    source_type: row.get(2)?,
+                    conversation_id: row.get(3)?,
+                    turn_id: row.get(4)?,
+                    actor_id: row.get(5)?,
+                    observed_at: row.get::<_, Option<i64>>(6)?.map(|t| t as Timestamp),
+                    extractor: row.get(7)?,
+                    extractor_hash: row.get(8)?,
+                    prompt_hash: row.get(9)?,
+                    payload_json: row.get(10)?,
+                    created_at: row.get::<_, i64>(11)? as Timestamp,
+                })
+            })
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(store_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Add or update a canonical entity.
+    pub fn upsert_entity(&self, entity: &EntityRecord) -> Result<(), MenteError> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(store_err)?;
+        Self::upsert_entity_on(&tx, entity)?;
+        tx.commit().map_err(store_err)
+    }
+
+    /// Load an entity by id.
+    pub fn get_entity(&self, entity_id: &str) -> Result<Option<EntityRecord>, MenteError> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            r#"
+            SELECT entity_id, entity_type, canonical, attributes_json,
+                   confidence, created_at, updated_at
+            FROM entities
+            WHERE entity_id = ?1
+            "#,
+            params![entity_id],
+            |row| {
+                Ok(EntityRecord {
+                    entity_id: row.get(0)?,
+                    entity_type: row.get(1)?,
+                    canonical: row.get(2)?,
+                    attributes_json: row.get(3)?,
+                    confidence: row.get::<_, f64>(4)? as f32,
+                    created_at: row.get::<_, i64>(5)? as Timestamp,
+                    updated_at: row.get::<_, i64>(6)? as Timestamp,
+                })
+            },
+        )
+        .optional()
+        .map_err(store_err)
+    }
+
+    /// List canonical entities, sorted by update time.
+    pub fn list_entities(&self, limit: usize) -> Result<Vec<EntityRecord>, MenteError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT entity_id, entity_type, canonical, attributes_json,
+                       confidence, created_at, updated_at
+                FROM entities
+                ORDER BY updated_at DESC
+                LIMIT ?1
+                "#,
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![usize_to_i64(limit)?], |row| {
+                Ok(EntityRecord {
+                    entity_id: row.get(0)?,
+                    entity_type: row.get(1)?,
+                    canonical: row.get(2)?,
+                    attributes_json: row.get(3)?,
+                    confidence: row.get::<_, f64>(4)? as f32,
+                    created_at: row.get::<_, i64>(5)? as Timestamp,
+                    updated_at: row.get::<_, i64>(6)? as Timestamp,
+                })
+            })
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(store_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Add or update an alias for an entity.
+    pub fn add_entity_alias(&self, alias: &EntityAlias) -> Result<(), MenteError> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(store_err)?;
+        Self::add_entity_alias_on(&tx, alias)?;
+        tx.commit().map_err(store_err)
+    }
+
+    /// List aliases for an entity.
+    pub fn entity_aliases(&self, entity_id: &str) -> Result<Vec<EntityAlias>, MenteError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT entity_id, alias, source, confidence
+                FROM entity_aliases
+                WHERE entity_id = ?1
+                ORDER BY alias ASC
+                "#,
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![entity_id], |row| {
+                Ok(EntityAlias {
+                    entity_id: row.get(0)?,
+                    alias: row.get(1)?,
+                    source: row.get(2)?,
+                    confidence: row.get::<_, f64>(3)? as f32,
+                })
+            })
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(store_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Resolve entities by alias.
+    pub fn entities_by_alias(&self, alias: &str) -> Result<Vec<EntityRecord>, MenteError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT e.entity_id, e.entity_type, e.canonical, e.attributes_json,
+                       e.confidence, e.created_at, e.updated_at
+                FROM entity_aliases a
+                JOIN entities e ON e.entity_id = a.entity_id
+                WHERE a.alias = ?1
+                ORDER BY a.confidence DESC, e.updated_at DESC
+                "#,
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![alias], |row| {
+                Ok(EntityRecord {
+                    entity_id: row.get(0)?,
+                    entity_type: row.get(1)?,
+                    canonical: row.get(2)?,
+                    attributes_json: row.get(3)?,
+                    confidence: row.get::<_, f64>(4)? as f32,
+                    created_at: row.get::<_, i64>(5)? as Timestamp,
+                    updated_at: row.get::<_, i64>(6)? as Timestamp,
+                })
+            })
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(store_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Link a memory to a canonical entity.
+    pub fn link_memory_entity(&self, link: &MemoryEntityLink) -> Result<(), MenteError> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(store_err)?;
+        Self::link_memory_entity_on(&tx, link)?;
+        tx.commit().map_err(store_err)
+    }
+
+    /// Entity links for one memory.
+    pub fn memory_entity_links(&self, id: MemoryId) -> Result<Vec<MemoryEntityLink>, MenteError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT memory_id, entity_id, role, confidence, evidence
+                FROM memory_entities
+                WHERE memory_id = ?1
+                ORDER BY confidence DESC, entity_id ASC
+                "#,
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![id.to_string()], |row| {
+                let role: String = row.get(2)?;
+                Ok(MemoryEntityLink {
+                    memory_id: parse_id::<MemoryId>(&row.get::<_, String>(0)?)
+                        .unwrap_or_else(|_| MemoryId::nil()),
+                    entity_id: row.get(1)?,
+                    role: if role.is_empty() { None } else { Some(role) },
+                    confidence: row.get::<_, f64>(3)? as f32,
+                    evidence: row.get(4)?,
+                })
+            })
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(store_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Memory links for one entity.
+    pub fn memories_for_entity(
+        &self,
+        entity_id: &str,
+    ) -> Result<Vec<MemoryEntityLink>, MenteError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT memory_id, entity_id, role, confidence, evidence
+                FROM memory_entities
+                WHERE entity_id = ?1
+                ORDER BY confidence DESC, memory_id ASC
+                "#,
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![entity_id], |row| {
+                let role: String = row.get(2)?;
+                Ok(MemoryEntityLink {
+                    memory_id: parse_id::<MemoryId>(&row.get::<_, String>(0)?)
+                        .unwrap_or_else(|_| MemoryId::nil()),
+                    entity_id: row.get(1)?,
+                    role: if role.is_empty() { None } else { Some(role) },
+                    confidence: row.get::<_, f64>(3)? as f32,
+                    evidence: row.get(4)?,
+                })
+            })
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(store_err)?);
+        }
+        Ok(out)
     }
 
     /// Load a memory by id, including its tags. Returns `None` if absent.
@@ -529,17 +1456,23 @@ impl Backend {
                     let emb_blob: Option<Vec<u8>> = row.get(5)?;
                     Ok(MemoryNode {
                         id: parse_id(&row.get::<_, String>(0)?).unwrap_or_else(|_| MemoryId::nil()),
-                        agent_id: parse_id(&row.get::<_, String>(1)?).unwrap_or_else(|_| AgentId::nil()),
-                        space_id: parse_id(&row.get::<_, String>(2)?).unwrap_or_else(|_| SpaceId::nil()),
+                        agent_id: parse_id(&row.get::<_, String>(1)?)
+                            .unwrap_or_else(|_| AgentId::nil()),
+                        space_id: parse_id(&row.get::<_, String>(2)?)
+                            .unwrap_or_else(|_| SpaceId::nil()),
                         memory_type: parse_memory_type(&row.get::<_, String>(3)?),
                         content: row.get(4)?,
-                        embedding: emb_blob.as_deref().map(blob_to_embedding).unwrap_or_default(),
+                        embedding: emb_blob
+                            .as_deref()
+                            .map(blob_to_embedding)
+                            .unwrap_or_default(),
                         created_at: row.get::<_, i64>(6)? as u64,
                         accessed_at: row.get::<_, i64>(7)? as u64,
                         access_count: row.get::<_, i64>(8)? as u32,
                         salience: row.get::<_, f64>(9)? as f32,
                         confidence: row.get::<_, f64>(10)? as f32,
-                        attributes: serde_json::from_str(&row.get::<_, String>(11)?).unwrap_or_default(),
+                        attributes: serde_json::from_str(&row.get::<_, String>(11)?)
+                            .unwrap_or_default(),
                         valid_from: row.get::<_, Option<i64>>(12)?.map(|t| t as u64),
                         valid_until: row.get::<_, Option<i64>>(13)?.map(|t| t as u64),
                         tags: Vec::new(),
@@ -570,9 +1503,10 @@ impl Backend {
     /// Delete a memory, its vector row, and its tags. Returns `true` if a row
     /// was removed.
     pub fn delete_memory(&self, id: MemoryId) -> Result<bool, MenteError> {
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(store_err)?;
         let id_str = id.to_string();
-        let rowid: Option<i64> = conn
+        let rowid: Option<i64> = tx
             .query_row(
                 "SELECT rowid FROM memories WHERE id = ?1",
                 params![id_str],
@@ -583,11 +1517,34 @@ impl Backend {
         let Some(rowid) = rowid else {
             return Ok(false);
         };
-        conn.execute("DELETE FROM memories WHERE id = ?1", params![id_str])
+        let _ = tx.execute("DELETE FROM memory_vec WHERE rowid = ?1", params![rowid]);
+        let tag_count = tx
+            .execute(
+                "DELETE FROM memory_tags WHERE memory_id = ?1",
+                params![id_str],
+            )
             .map_err(store_err)?;
-        let _ = conn.execute("DELETE FROM memory_vec WHERE rowid = ?1", params![rowid]);
-        conn.execute("DELETE FROM memory_tags WHERE memory_id = ?1", params![id_str])
+        let edge_count = tx
+            .execute(
+                "DELETE FROM edges WHERE source = ?1 OR target = ?1",
+                params![id_str],
+            )
             .map_err(store_err)?;
+        tx.execute("DELETE FROM memories WHERE id = ?1", params![id_str])
+            .map_err(store_err)?;
+        Self::record_operation_on(
+            &tx,
+            "memory_delete",
+            Some(id),
+            None,
+            None,
+            json!({
+                "rowid": rowid,
+                "deleted_tags": tag_count,
+                "deleted_edges": edge_count,
+            }),
+        )?;
+        tx.commit().map_err(store_err)?;
         Ok(true)
     }
 
@@ -641,24 +1598,25 @@ impl Backend {
                 )
                 .optional()
                 .map_err(store_err)?;
-            if let Some(id_str) = id_str {
-                if let Ok(id) = parse_id(&id_str) {
-                    out.push((id, l2_distance_to_similarity(dist)));
-                }
+            if let Some(id_str) = id_str
+                && let Ok(id) = parse_id(&id_str)
+            {
+                out.push((id, l2_distance_to_similarity(dist)));
             }
         }
         Ok(out)
     }
 
     // -----------------------------------------------------------------------
-    // Edges (knowledge graph) — replaces the CSR/CSC graph engine.
+    // Edges (knowledge graph), replaces the CSR/CSC graph engine.
     // -----------------------------------------------------------------------
 
     /// Insert a typed, weighted, optionally temporally-bounded edge between two
     /// memories. Duplicate edges are permitted (the original CSR did too).
     pub fn add_edge(&self, edge: &MemoryEdge) -> Result<(), MenteError> {
-        let conn = self.conn.lock();
-        conn.execute(
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(store_err)?;
+        tx.execute(
             r#"INSERT INTO edges
                  (source, target, edge_type, weight, created_at, valid_from, valid_until, label)
                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
@@ -670,10 +1628,25 @@ impl Backend {
                 edge.created_at as i64,
                 edge.valid_from.map(|t| t as i64),
                 edge.valid_until.map(|t| t as i64),
-                edge.label,
+                edge.label.as_deref(),
             ],
         )
         .map_err(store_err)?;
+        Self::record_operation_on(
+            &tx,
+            "edge_insert",
+            None,
+            Some(edge.source),
+            Some(edge.target),
+            json!({
+                "edge_type": edge_type_str(edge.edge_type),
+                "weight": edge.weight,
+                "valid_from": edge.valid_from,
+                "valid_until": edge.valid_until,
+                "label": edge.label.as_deref(),
+            }),
+        )?;
+        tx.commit().map_err(store_err)?;
         Ok(())
     }
 
@@ -714,9 +1687,15 @@ impl Backend {
         let conn = self.conn.lock();
         let id_str = id.to_string();
         let sql = match dir {
-            Direction::Outgoing => "SELECT source, target, edge_type, weight, created_at, valid_from, valid_until, label FROM edges WHERE source = ?1",
-            Direction::Incoming => "SELECT source, target, edge_type, weight, created_at, valid_from, valid_until, label FROM edges WHERE target = ?1",
-            Direction::Both => "SELECT source, target, edge_type, weight, created_at, valid_from, valid_until, label FROM edges WHERE source = ?1 OR target = ?1",
+            Direction::Outgoing => {
+                "SELECT source, target, edge_type, weight, created_at, valid_from, valid_until, label FROM edges WHERE source = ?1"
+            }
+            Direction::Incoming => {
+                "SELECT source, target, edge_type, weight, created_at, valid_from, valid_until, label FROM edges WHERE target = ?1"
+            }
+            Direction::Both => {
+                "SELECT source, target, edge_type, weight, created_at, valid_from, valid_until, label FROM edges WHERE source = ?1 OR target = ?1"
+            }
         };
         let mut stmt = conn.prepare(sql).map_err(store_err)?;
         let rows = stmt
@@ -823,7 +1802,8 @@ impl Backend {
         let mut stmt = conn.prepare(&sql).map_err(store_err)?;
         let rows = stmt
             .query_map(rusqlite::params_from_iter(params_vec.into_iter()), |row| {
-                Ok(parse_id::<MemoryId>(&row.get::<_, String>(0)?).unwrap_or_else(|_| MemoryId::nil()))
+                Ok(parse_id::<MemoryId>(&row.get::<_, String>(0)?)
+                    .unwrap_or_else(|_| MemoryId::nil()))
             })
             .map_err(store_err)?;
         let mut out = HashSet::new();
@@ -835,15 +1815,29 @@ impl Backend {
 
     /// Remove every edge that touches `id` (used when forgetting a memory).
     pub fn delete_edges_for(&self, id: MemoryId) -> Result<(), MenteError> {
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(store_err)?;
         let s = id.to_string();
-        conn.execute("DELETE FROM edges WHERE source = ?1 OR target = ?1", params![s])
+        let deleted = tx
+            .execute(
+                "DELETE FROM edges WHERE source = ?1 OR target = ?1",
+                params![s],
+            )
             .map_err(store_err)?;
+        Self::record_operation_on(
+            &tx,
+            "edge_delete_for_memory",
+            Some(id),
+            None,
+            None,
+            json!({ "deleted_edges": deleted }),
+        )?;
+        tx.commit().map_err(store_err)?;
         Ok(())
     }
 
     // -----------------------------------------------------------------------
-    // Bulk helpers — replace StorageEngine::scan_all_memories / store_memory_batch
+    // Bulk helpers, replace StorageEngine::scan_all_memories / store_memory_batch
     // -----------------------------------------------------------------------
 
     /// Every stored memory id (used on open instead of rebuilding a page map).
@@ -852,7 +1846,8 @@ impl Backend {
         let mut stmt = conn.prepare("SELECT id FROM memories").map_err(store_err)?;
         let rows = stmt
             .query_map([], |row| {
-                Ok(parse_id::<MemoryId>(&row.get::<_, String>(0)?).unwrap_or_else(|_| MemoryId::nil()))
+                Ok(parse_id::<MemoryId>(&row.get::<_, String>(0)?)
+                    .unwrap_or_else(|_| MemoryId::nil()))
             })
             .map_err(store_err)?;
         let mut out = Vec::new();
@@ -875,13 +1870,8 @@ impl Backend {
         Ok(out)
     }
 
-    /// Validate and persist many nodes. Dimensions are checked up front so a
-    /// bad row aborts before any write. Each node goes through [`store_memory`]
-    /// (its own implicit transaction); for true single-transaction batching we
-    /// would fold the per-node SQL under one `tx`, but per-item cost is
-    /// dominated by SQLite I/O anyway.
-    ///
-    /// [`store_memory`]: Backend::store_memory
+    /// Validate and persist many nodes in one SQLite transaction. Dimensions
+    /// are checked up front so a bad row aborts before any write.
     pub fn store_memory_batch(&self, nodes: &[MemoryNode]) -> Result<(), MenteError> {
         let dim = self.embedding_dim.load(Ordering::Relaxed);
         // Validate up front so a bad row aborts before any write. Only enforce
@@ -895,14 +1885,259 @@ impl Backend {
                 });
             }
         }
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(store_err)?;
         for n in nodes {
-            self.store_memory(n)?;
+            Self::store_memory_on(&tx, n, dim)?;
+        }
+        tx.commit().map_err(store_err)
+    }
+
+    /// Recent write-side audit rows, newest first.
+    pub fn recent_operations(&self, limit: usize) -> Result<Vec<MemoryOperation>, MenteError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT operation_id, operation_type, memory_id, source, target,
+                       payload_json, created_at
+                FROM memory_operations
+                ORDER BY created_at DESC
+                LIMIT ?1
+                "#,
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![usize_to_i64(limit)?], |row| {
+                Ok(MemoryOperation {
+                    operation_id: row.get(0)?,
+                    operation_type: row.get(1)?,
+                    memory_id: parse_optional_memory_id(row.get(2)?),
+                    source: parse_optional_memory_id(row.get(3)?),
+                    target: parse_optional_memory_id(row.get(4)?),
+                    payload_json: row.get(5)?,
+                    created_at: row.get::<_, i64>(6)? as Timestamp,
+                })
+            })
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(store_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Recent persisted retrieval traces, newest first.
+    pub fn recent_retrieval_traces(&self, limit: usize) -> Result<Vec<RetrievalTrace>, MenteError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT trace_id, query_text, query_embedding_dim, k, fetch_k,
+                       tags_json, tags_or, time_start, time_end,
+                       candidate_count, result_count, created_at
+                FROM retrieval_traces
+                ORDER BY created_at DESC
+                LIMIT ?1
+                "#,
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![usize_to_i64(limit)?], |row| {
+                let time_start: Option<i64> = row.get(7)?;
+                let time_end: Option<i64> = row.get(8)?;
+                let time_range = match (time_start, time_end) {
+                    (Some(start), Some(end)) => Some((start as Timestamp, end as Timestamp)),
+                    _ => None,
+                };
+                Ok(RetrievalTrace {
+                    trace_id: row.get(0)?,
+                    query_text: row.get(1)?,
+                    query_embedding_dim: row.get::<_, i64>(2)? as usize,
+                    k: row.get::<_, i64>(3)? as usize,
+                    fetch_k: row.get::<_, i64>(4)? as usize,
+                    tags: parse_tags_json(&row.get::<_, String>(5)?),
+                    tags_or: row.get::<_, i64>(6)? != 0,
+                    time_range,
+                    candidate_count: row.get::<_, i64>(9)? as usize,
+                    result_count: row.get::<_, i64>(10)? as usize,
+                    created_at: row.get::<_, i64>(11)? as Timestamp,
+                })
+            })
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(store_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Final ranked hits for a persisted retrieval trace.
+    pub fn retrieval_trace_hits(
+        &self,
+        trace_id: &str,
+    ) -> Result<Vec<RetrievalTraceHit>, MenteError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT trace_id, rank, memory_id, score, vector_rank, bm25_rank, salience
+                FROM retrieval_trace_hits
+                WHERE trace_id = ?1
+                ORDER BY rank ASC
+                "#,
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![trace_id], |row| {
+                let memory_id = parse_id::<MemoryId>(&row.get::<_, String>(2)?)
+                    .unwrap_or_else(|_| MemoryId::nil());
+                Ok(RetrievalTraceHit {
+                    trace_id: row.get(0)?,
+                    rank: row.get::<_, i64>(1)? as usize,
+                    memory_id,
+                    score: row.get::<_, f64>(3)? as f32,
+                    vector_rank: row.get::<_, Option<i64>>(4)?.map(|rank| rank as usize),
+                    bm25_rank: row.get::<_, Option<i64>>(5)?.map(|rank| rank as usize),
+                    salience: row.get::<_, Option<f64>>(6)?.map(|score| score as f32),
+                })
+            })
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(store_err)?);
+        }
+        Ok(out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_retrieval_trace(
+        &self,
+        query_embedding_dim: usize,
+        query_text: Option<&str>,
+        tags: Option<&[&str]>,
+        tags_or: bool,
+        time_range: Option<(Timestamp, Timestamp)>,
+        k: usize,
+        fetch_k: usize,
+        candidate_count: usize,
+        scored: &[(MemoryId, f32)],
+        vector_hits: &[MemoryId],
+        bm25_hits: &[MemoryId],
+        config: &RetrievalConfig,
+    ) -> Result<(), MenteError> {
+        let trace_id = Uuid::new_v4().to_string();
+        let created_at = now_us();
+        let config_json = retrieval_config_json(config)?;
+        let tags_json = tags_json(tags)?;
+        let vector_ranks: HashMap<MemoryId, usize> = vector_hits
+            .iter()
+            .enumerate()
+            .map(|(rank, id)| (*id, rank + 1))
+            .collect();
+        let bm25_ranks: HashMap<MemoryId, usize> = bm25_hits
+            .iter()
+            .enumerate()
+            .map(|(rank, id)| (*id, rank + 1))
+            .collect();
+
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(store_err)?;
+        tx.execute(
+            r#"
+            INSERT INTO retrieval_traces (
+                trace_id, query_text, query_embedding_dim, k, fetch_k,
+                tags_json, tags_or, time_start, time_end, candidate_count,
+                result_count, config_json, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            "#,
+            params![
+                trace_id,
+                query_text,
+                usize_to_i64(query_embedding_dim)?,
+                usize_to_i64(k)?,
+                usize_to_i64(fetch_k)?,
+                tags_json,
+                if tags_or { 1_i64 } else { 0_i64 },
+                time_range.map(|(start, _)| start as i64),
+                time_range.map(|(_, end)| end as i64),
+                usize_to_i64(candidate_count)?,
+                usize_to_i64(scored.len())?,
+                config_json,
+                created_at as i64,
+            ],
+        )
+        .map_err(store_err)?;
+
+        for (rank, (id, score)) in scored.iter().enumerate() {
+            let salience: Option<f64> = tx
+                .query_row(
+                    "SELECT salience FROM memories WHERE id = ?1",
+                    params![id.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(store_err)?;
+            tx.execute(
+                r#"
+                INSERT INTO retrieval_trace_hits (
+                    trace_id, rank, memory_id, score, vector_rank, bm25_rank, salience
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                "#,
+                params![
+                    trace_id,
+                    usize_to_i64(rank + 1)?,
+                    id.to_string(),
+                    *score as f64,
+                    vector_ranks.get(id).map(|rank| *rank as i64),
+                    bm25_ranks.get(id).map(|rank| *rank as i64),
+                    salience,
+                ],
+            )
+            .map_err(store_err)?;
+        }
+
+        Self::purge_old_traces_on(&tx, config.trace_retention_limit)?;
+        tx.commit().map_err(store_err)
+    }
+
+    fn purge_old_traces_on(tx: &rusqlite::Transaction<'_>, keep: usize) -> Result<(), MenteError> {
+        let stale: Vec<String> = {
+            let mut stmt = tx
+                .prepare(
+                    r#"
+                    SELECT trace_id FROM retrieval_traces
+                    ORDER BY created_at DESC
+                    LIMIT -1 OFFSET ?1
+                    "#,
+                )
+                .map_err(store_err)?;
+            let rows = stmt
+                .query_map(params![usize_to_i64(keep)?], |row| row.get::<_, String>(0))
+                .map_err(store_err)?;
+            let mut stale = Vec::new();
+            for row in rows {
+                stale.push(row.map_err(store_err)?);
+            }
+            stale
+        };
+        for trace_id in stale {
+            tx.execute(
+                "DELETE FROM retrieval_trace_hits WHERE trace_id = ?1",
+                params![trace_id],
+            )
+            .map_err(store_err)?;
+            tx.execute(
+                "DELETE FROM retrieval_traces WHERE trace_id = ?1",
+                params![trace_id],
+            )
+            .map_err(store_err)?;
         }
         Ok(())
     }
 
     // -----------------------------------------------------------------------
-    // Hybrid search — replaces IndexManager (RRF over vec0 + FTS5 BM25).
+    // Hybrid search, replaces IndexManager (RRF over vec0 + FTS5 BM25).
     // -----------------------------------------------------------------------
 
     /// Vector + optional BM25 hybrid search (no tag filter). Mirrors
@@ -932,13 +2167,10 @@ impl Backend {
     /// Hybrid search with configurable tag mode (AND vs OR). Mirrors
     /// `IndexManager::hybrid_search_with_query_mode`.
     ///
-    /// Algorithm (faithful port of the IndexManager fusion): take the top
-    /// `k*4` vector candidates (vec0 KNN, or brute-force cosine over the
-    /// filter candidate set when tag/time filters are present), take the top
-    /// `k*4` BM25 candidates from FTS5, merge via Reciprocal Rank Fusion
-    /// (rrf_k = 60), drop anything outside the candidate set, then boost by
-    /// salience (×0.05) and a fixed recency term (×0.02 × 0.5) before
-    /// truncating to `k`.
+    /// Algorithm: take an over-fetched vector candidate set, optionally take
+    /// BM25 candidates from FTS5, merge via Reciprocal Rank Fusion, drop
+    /// anything outside the tag/time filter, then boost by salience and the
+    /// configured recency prior before truncating to `k`.
     pub fn hybrid_search_with_query_mode(
         &self,
         query_embedding: &[f32],
@@ -951,13 +2183,32 @@ impl Backend {
         if k == 0 || query_embedding.is_empty() {
             return Ok(Vec::new());
         }
-        let fetch_k = k * 4;
-        let rrf_k: f32 = 60.0;
+        let config = self.retrieval_config();
+        let fetch_multiplier = config.fetch_multiplier.max(1);
+        let fetch_k = k.saturating_mul(fetch_multiplier).max(k);
 
         // 1) Candidate filter set from tags + time window.
         let candidate_set = self.candidate_set(tags, tags_or, time_range)?;
         // Filters requested but nothing matches → no results.
         if matches!(candidate_set.as_ref().map(|s| s.len()), Some(0)) {
+            if self.retrieval_tracing_enabled()
+                && let Err(e) = self.record_retrieval_trace(
+                    query_embedding.len(),
+                    query_text,
+                    tags,
+                    tags_or,
+                    time_range,
+                    k,
+                    fetch_k,
+                    0,
+                    &[],
+                    &[],
+                    &[],
+                    &config,
+                )
+            {
+                tracing::warn!("failed to record empty retrieval trace: {e}");
+            }
             return Ok(Vec::new());
         }
 
@@ -980,38 +2231,74 @@ impl Backend {
         };
 
         if vector_hits.is_empty() && bm25_hits.is_empty() {
+            if self.retrieval_tracing_enabled()
+                && let Err(e) = self.record_retrieval_trace(
+                    query_embedding.len(),
+                    query_text,
+                    tags,
+                    tags_or,
+                    time_range,
+                    k,
+                    fetch_k,
+                    0,
+                    &[],
+                    &vector_hits,
+                    &bm25_hits,
+                    &config,
+                )
+            {
+                tracing::warn!("failed to record empty retrieval trace: {e}");
+            }
             return Ok(Vec::new());
         }
 
         // 4) Reciprocal Rank Fusion.
         let mut rrf: HashMap<MemoryId, f32> = HashMap::new();
         for (rank, id) in vector_hits.iter().enumerate() {
-            *rrf.entry(*id).or_insert(0.0) += 1.0 / (rrf_k + rank as f32);
+            *rrf.entry(*id).or_insert(0.0) += 1.0 / (config.rrf_k + rank as f32);
         }
         for (rank, id) in bm25_hits.iter().enumerate() {
-            *rrf.entry(*id).or_insert(0.0) += 1.0 / (rrf_k + rank as f32);
+            *rrf.entry(*id).or_insert(0.0) += 1.0 / (config.rrf_k + rank as f32);
         }
+        let candidate_count = rrf.len();
 
         // 5) Apply the candidate filter (drops bm25 hits that fall outside it)
         //    and add the salience + recency boost.
         let mut scored: Vec<(MemoryId, f32)> = Vec::with_capacity(rrf.len());
         for (id, rrf_score) in rrf {
-            if let Some(cs) = &candidate_set {
-                if !cs.contains(&id) {
-                    continue;
-                }
+            if let Some(cs) = &candidate_set
+                && !cs.contains(&id)
+            {
+                continue;
             }
             let salience = self.salience_of(id)?.unwrap_or(0.5);
-            let recency = 0.5f32;
-            let combined = rrf_score * 0.7 + salience * 0.05 + recency * 0.02;
+            let combined = rrf_score * config.rrf_weight
+                + salience * config.salience_weight
+                + config.recency_prior * config.recency_weight;
             scored.push((id, combined));
         }
 
         // 6) Rank and truncate.
-        scored.sort_unstable_by(|a, b| {
-            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        scored.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(k);
+        if self.retrieval_tracing_enabled()
+            && let Err(e) = self.record_retrieval_trace(
+                query_embedding.len(),
+                query_text,
+                tags,
+                tags_or,
+                time_range,
+                k,
+                fetch_k,
+                candidate_count,
+                &scored,
+                &vector_hits,
+                &bm25_hits,
+                &config,
+            )
+        {
+            tracing::warn!("failed to record retrieval trace: {e}");
+        }
         Ok(scored)
     }
 
@@ -1047,9 +2334,7 @@ impl Backend {
         let conn = self.conn.lock();
         let placeholders = tags.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let sql = if or {
-            format!(
-                "SELECT DISTINCT memory_id FROM memory_tags WHERE tag IN ({placeholders})"
-            )
+            format!("SELECT DISTINCT memory_id FROM memory_tags WHERE tag IN ({placeholders})")
         } else {
             format!(
                 "SELECT memory_id FROM memory_tags WHERE tag IN ({placeholders})
@@ -1078,7 +2363,11 @@ impl Backend {
     }
 
     /// Memory ids whose `created_at` falls within `[start, end]` inclusive.
-    fn ids_matching_time(&self, start: Timestamp, end: Timestamp) -> MenteResult<HashSet<MemoryId>> {
+    fn ids_matching_time(
+        &self,
+        start: Timestamp,
+        end: Timestamp,
+    ) -> MenteResult<HashSet<MemoryId>> {
         let conn = self.conn.lock();
         let mut stmt = conn
             .prepare("SELECT id FROM memories WHERE created_at >= ?1 AND created_at <= ?2")
@@ -1133,9 +2422,7 @@ impl Backend {
             let (id, emb) = row.map_err(store_err)?;
             scored.push((id, dot(&qnorm, &normalize(&emb))));
         }
-        scored.sort_unstable_by(|a, b| {
-            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        scored.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(k);
         Ok(scored.into_iter().map(|(id, _)| id).collect())
     }
@@ -1155,8 +2442,7 @@ impl Backend {
             )
             .map_err(store_err)?;
         let rows_result = stmt.query_map(params![query_text, k as i64], |row| {
-            Ok(parse_id::<MemoryId>(&row.get::<_, String>(0)?)
-                .unwrap_or_else(|_| MemoryId::nil()))
+            Ok(parse_id::<MemoryId>(&row.get::<_, String>(0)?).unwrap_or_else(|_| MemoryId::nil()))
         });
         let mut out = Vec::new();
         match rows_result {
@@ -1198,7 +2484,12 @@ mod tests {
     use mentedb_core::types::{AgentId, MemoryId};
 
     fn make_node(id: MemoryId, content: &str, embedding: Vec<f32>) -> MemoryNode {
-        let mut n = MemoryNode::new(AgentId::new(), MemoryType::Semantic, content.to_string(), embedding);
+        let mut n = MemoryNode::new(
+            AgentId::new(),
+            MemoryType::Semantic,
+            content.to_string(),
+            embedding,
+        );
         n.id = id;
         n.tags = vec!["pref".to_string(), "ui".to_string()];
         n.salience = 0.8;
@@ -1226,8 +2517,10 @@ mod tests {
     fn store_upserts_on_same_id() {
         let db = Backend::open_in_memory(2).unwrap();
         let id = MemoryId::new();
-        db.store_memory(&make_node(id, "first", vec![1.0, 0.0])).unwrap();
-        db.store_memory(&make_node(id, "second", vec![0.0, 1.0])).unwrap();
+        db.store_memory(&make_node(id, "first", vec![1.0, 0.0]))
+            .unwrap();
+        db.store_memory(&make_node(id, "second", vec![0.0, 1.0]))
+            .unwrap();
         assert_eq!(db.count().unwrap(), 1);
         let loaded = db.get_memory(id).unwrap().unwrap();
         assert_eq!(loaded.content, "second");
@@ -1238,7 +2531,8 @@ mod tests {
     fn delete_removes_memory_and_vector() {
         let db = Backend::open_in_memory(2).unwrap();
         let id = MemoryId::new();
-        db.store_memory(&make_node(id, "gone", vec![1.0, 0.0])).unwrap();
+        db.store_memory(&make_node(id, "gone", vec![1.0, 0.0]))
+            .unwrap();
         assert!(db.delete_memory(id).unwrap());
         assert!(db.get_memory(id).unwrap().is_none());
         assert!(db.knn(&[1.0, 0.0], 5).unwrap().is_empty());
@@ -1251,15 +2545,22 @@ mod tests {
         let b = MemoryId::new();
         let c = MemoryId::new();
         // Three points on the unit circle.
-        db.store_memory(&make_node(a, "east",  vec![1.0, 0.0])).unwrap();
-        db.store_memory(&make_node(b, "north", vec![0.0, 1.0])).unwrap();
-        db.store_memory(&make_node(c, "sw",    vec![-0.7, -0.7])).unwrap();
+        db.store_memory(&make_node(a, "east", vec![1.0, 0.0]))
+            .unwrap();
+        db.store_memory(&make_node(b, "north", vec![0.0, 1.0]))
+            .unwrap();
+        db.store_memory(&make_node(c, "sw", vec![-0.7, -0.7]))
+            .unwrap();
 
         // Query near "east": a must rank first, c last.
         let hits = db.knn(&[0.9, 0.1], 3).unwrap();
         assert_eq!(hits.len(), 3);
         assert_eq!(hits[0].0, a, "east should be nearest");
-        assert!(hits[0].1 > 0.95, "east similarity should be ~1, got {}", hits[0].1);
+        assert!(
+            hits[0].1 > 0.95,
+            "east similarity should be ~1, got {}",
+            hits[0].1
+        );
         assert_eq!(hits[2].0, c, "sw should be farthest");
         assert!(hits[2].1 < hits[0].1);
     }
@@ -1271,7 +2572,10 @@ mod tests {
         let res = db.store_memory(&make_node(id, "bad", vec![0.1, 0.2]));
         assert!(matches!(
             res,
-            Err(MenteError::EmbeddingDimensionMismatch { got: 2, expected: 3 })
+            Err(MenteError::EmbeddingDimensionMismatch {
+                got: 2,
+                expected: 3
+            })
         ));
     }
 
@@ -1282,7 +2586,8 @@ mod tests {
         let id = MemoryId::new();
         {
             let db = Backend::open(&path, 2).unwrap();
-            db.store_memory(&make_node(id, "persisted", vec![1.0, 0.0])).unwrap();
+            db.store_memory(&make_node(id, "persisted", vec![1.0, 0.0]))
+                .unwrap();
         }
         let db = Backend::open(&path, 2).unwrap();
         let loaded = db.get_memory(id).unwrap().expect("should survive reopen");
@@ -1332,12 +2637,17 @@ mod tests {
         let b = MemoryId::new();
         let c = MemoryId::new();
         db.add_edge(&edge(a, b, EdgeType::Related, 0.5)).unwrap();
-        db.add_edge(&edge(a, c, EdgeType::Contradicts, 0.9)).unwrap();
+        db.add_edge(&edge(a, c, EdgeType::Contradicts, 0.9))
+            .unwrap();
 
-        let related = db.neighbors(a, Some(&[EdgeType::Related]), Direction::Outgoing).unwrap();
+        let related = db
+            .neighbors(a, Some(&[EdgeType::Related]), Direction::Outgoing)
+            .unwrap();
         assert_eq!(related, vec![b]);
 
-        let contradicts = db.neighbors(a, Some(&[EdgeType::Contradicts]), Direction::Outgoing).unwrap();
+        let contradicts = db
+            .neighbors(a, Some(&[EdgeType::Contradicts]), Direction::Outgoing)
+            .unwrap();
         assert_eq!(contradicts, vec![c]);
 
         let all = db.neighbors(a, None, Direction::Outgoing).unwrap();
@@ -1418,8 +2728,10 @@ mod tests {
         let db = Backend::open_in_memory(2).unwrap();
         let a = MemoryId::new();
         let b = MemoryId::new();
-        db.store_memory(&make_node(a, "east text", vec![1.0, 0.0])).unwrap();
-        db.store_memory(&make_node(b, "north text", vec![0.0, 1.0])).unwrap();
+        db.store_memory(&make_node(a, "east text", vec![1.0, 0.0]))
+            .unwrap();
+        db.store_memory(&make_node(b, "north text", vec![0.0, 1.0]))
+            .unwrap();
 
         let res = db.hybrid_search(&[0.95, 0.05], None, None, 2).unwrap();
         assert_eq!(res.len(), 2);
@@ -1433,15 +2745,135 @@ mod tests {
         let b = MemoryId::new();
         // `a` is vector-far but keyword-matches "postgres"; `b` is vector-close
         // but has no matching keyword. RRF must still surface `a`.
-        db.store_memory(&make_node(a, "postgres database migration", vec![0.0, 1.0])).unwrap();
-        db.store_memory(&make_node(b, "unrelated content", vec![1.0, 0.0])).unwrap();
+        db.store_memory(&make_node(a, "postgres database migration", vec![0.0, 1.0]))
+            .unwrap();
+        db.store_memory(&make_node(b, "unrelated content", vec![1.0, 0.0]))
+            .unwrap();
 
-        let res =
-            db.hybrid_search_with_query(&[1.0, 0.0], Some("postgres"), None, None, 2).unwrap();
+        let res = db
+            .hybrid_search_with_query(&[1.0, 0.0], Some("postgres"), None, None, 2)
+            .unwrap();
         assert!(
             res.iter().any(|(id, _)| *id == a),
             "bm25 match should surface a despite low vector similarity"
         );
+    }
+
+    #[test]
+    fn write_operations_are_recorded() {
+        let db = Backend::open_in_memory(2).unwrap();
+        let a = MemoryId::new();
+        let b = MemoryId::new();
+        db.store_memory(&make_node(a, "alpha", vec![1.0, 0.0]))
+            .unwrap();
+        db.add_edge(&edge(a, b, EdgeType::Related, 0.5)).unwrap();
+        db.delete_memory(a).unwrap();
+
+        let operations = db.recent_operations(10).unwrap();
+        assert!(
+            operations
+                .iter()
+                .any(|op| op.operation_type == "memory_upsert")
+        );
+        assert!(
+            operations
+                .iter()
+                .any(|op| op.operation_type == "edge_insert")
+        );
+        assert!(
+            operations
+                .iter()
+                .any(|op| op.operation_type == "memory_delete")
+        );
+    }
+
+    #[test]
+    fn memory_sources_roundtrip_with_store() {
+        let db = Backend::open_in_memory(2).unwrap();
+        let id = MemoryId::new();
+        let node = make_node(id, "source tracked", vec![1.0, 0.0]);
+        let mut source = MemorySource::new(id, "conversation_turn");
+        source.conversation_id = Some("conv-1".to_string());
+        source.turn_id = Some("turn-7".to_string());
+        source.actor_id = Some("user".to_string());
+        source.payload_json = json!({"raw": "source tracked"}).to_string();
+
+        db.store_memory_with_source(&node, &source).unwrap();
+
+        let sources = db.memory_sources(id).unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].source_type, "conversation_turn");
+        assert_eq!(sources[0].conversation_id.as_deref(), Some("conv-1"));
+
+        let operations = db.recent_operations(10).unwrap();
+        assert!(
+            operations
+                .iter()
+                .any(|op| op.operation_type == "memory_source_upsert")
+        );
+    }
+
+    #[test]
+    fn entities_aliases_and_memory_links_roundtrip() {
+        let db = Backend::open_in_memory(2).unwrap();
+        let id = MemoryId::new();
+        db.store_memory(&make_node(id, "Synapse uses MCP", vec![1.0, 0.0]))
+            .unwrap();
+
+        let mut entity = EntityRecord::new("project", "Synapse");
+        entity.confidence = 0.95;
+        let entity_id = entity.entity_id.clone();
+        db.upsert_entity(&entity).unwrap();
+        db.add_entity_alias(&EntityAlias {
+            entity_id: entity_id.clone(),
+            alias: "synapse".to_string(),
+            source: Some("test".to_string()),
+            confidence: 0.9,
+        })
+        .unwrap();
+        db.link_memory_entity(&MemoryEntityLink {
+            memory_id: id,
+            entity_id: entity_id.clone(),
+            role: Some("subject".to_string()),
+            confidence: 0.88,
+            evidence: Some("Synapse".to_string()),
+        })
+        .unwrap();
+
+        let by_alias = db.entities_by_alias("synapse").unwrap();
+        assert_eq!(by_alias.len(), 1);
+        assert_eq!(by_alias[0].canonical, "Synapse");
+
+        let links = db.memory_entity_links(id).unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].entity_id, entity_id);
+        assert_eq!(links[0].role.as_deref(), Some("subject"));
+    }
+
+    #[test]
+    fn retrieval_tracing_records_rank_inputs() {
+        let db = Backend::open_in_memory(2).unwrap();
+        db.set_retrieval_tracing(true);
+        let a = MemoryId::new();
+        let b = MemoryId::new();
+        db.store_memory(&make_node(a, "postgres database migration", vec![0.0, 1.0]))
+            .unwrap();
+        db.store_memory(&make_node(b, "unrelated content", vec![1.0, 0.0]))
+            .unwrap();
+
+        let res = db
+            .hybrid_search_with_query(&[1.0, 0.0], Some("postgres"), None, None, 2)
+            .unwrap();
+        assert!(!res.is_empty());
+
+        let traces = db.recent_retrieval_traces(1).unwrap();
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].query_text.as_deref(), Some("postgres"));
+        assert_eq!(traces[0].result_count, res.len());
+
+        let hits = db.retrieval_trace_hits(&traces[0].trace_id).unwrap();
+        assert_eq!(hits.len(), res.len());
+        assert!(hits.iter().any(|hit| hit.bm25_rank.is_some()));
     }
 
     #[test]
@@ -1456,7 +2888,9 @@ mod tests {
         db.store_memory(&na).unwrap();
         db.store_memory(&nb).unwrap();
 
-        let res = db.hybrid_search(&[1.0, 0.0], Some(&["x"]), None, 10).unwrap();
+        let res = db
+            .hybrid_search(&[1.0, 0.0], Some(&["x"]), None, 10)
+            .unwrap();
         assert_eq!(res.len(), 1);
         assert_eq!(res[0].0, a);
     }
@@ -1474,16 +2908,16 @@ mod tests {
         db.store_memory(&nb).unwrap();
 
         // AND mode: only `a` has both x and y.
-        let res =
-            db.hybrid_search_with_query_mode(&[1.0, 0.0], None, Some(&["x", "y"]), false, None, 10)
-                .unwrap();
+        let res = db
+            .hybrid_search_with_query_mode(&[1.0, 0.0], None, Some(&["x", "y"]), false, None, 10)
+            .unwrap();
         assert_eq!(res.len(), 1);
         assert_eq!(res[0].0, a);
 
         // OR mode: both have at least x.
-        let res_or =
-            db.hybrid_search_with_query_mode(&[1.0, 0.0], None, Some(&["x", "y"]), true, None, 10)
-                .unwrap();
+        let res_or = db
+            .hybrid_search_with_query_mode(&[1.0, 0.0], None, Some(&["x", "y"]), true, None, 10)
+            .unwrap();
         assert_eq!(res_or.len(), 2);
     }
 
@@ -1499,7 +2933,9 @@ mod tests {
         db.store_memory(&na).unwrap();
         db.store_memory(&nb).unwrap();
 
-        let res = db.hybrid_search(&[1.0, 0.0], None, Some((400, 600)), 10).unwrap();
+        let res = db
+            .hybrid_search(&[1.0, 0.0], None, Some((400, 600)), 10)
+            .unwrap();
         assert_eq!(res.len(), 1);
         assert_eq!(res[0].0, b);
     }
@@ -1517,7 +2953,8 @@ mod tests {
         {
             let db = Backend::open(&path, 0).unwrap();
             assert_eq!(db.embedding_dim(), 0);
-            db.store_memory(&make_node(id, "deferred", vec![1.0, 0.0])).unwrap();
+            db.store_memory(&make_node(id, "deferred", vec![1.0, 0.0]))
+                .unwrap();
             // No vec0 yet → KNN unavailable.
             assert!(db.knn(&[1.0, 0.0], 5).unwrap().is_empty());
             // Configuring the embedder builds the index and backfills.

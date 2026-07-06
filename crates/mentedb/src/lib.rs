@@ -32,11 +32,11 @@
 //!   auto-maintenance (decay / archival / consolidation)
 //! - Seven cognitive features: interference detection, pain signals, phantom tracking,
 //!   speculative caching, stream monitoring, trajectory tracking, write inference
-//! - HNSW vector index with hybrid search (vector + tags + temporal + salience)
-//! - CSR/CSC knowledge graph with belief propagation
+//! - SQLite + sqlite-vec storage with hybrid search (vector + BM25 + tags + temporal + salience)
+//! - Durable edge table with an in-memory graph mirror for belief propagation
 //! - Token budget aware context assembly with attention curve optimization
 //! - MQL query language with vector, tag, temporal, and graph traversal support
-//! - WAL based crash recovery with LZ4 compressed pages
+//! - SQLite WAL crash recovery plus explicit write and retrieval inspection tables
 //!
 //! ## Repository
 //!
@@ -91,8 +91,12 @@ pub use mentedb_graph as graph;
 pub use mentedb_index as index;
 /// MQL parser and query planner.
 pub use mentedb_query as query;
-/// Page based storage engine with WAL and buffer pool.
-pub use mentedb_storage as storage;
+/// SQLite storage backend and inspection types.
+pub use mentedb_sqlite as sqlite;
+pub use mentedb_sqlite::{
+    EntityAlias, EntityRecord, MemoryEntityLink, MemoryOperation, MemorySource, RetrievalConfig,
+    RetrievalTrace, RetrievalTraceHit,
+};
 
 /// Renderer-neutral graph projection DTOs for app clients.
 pub mod graph_projection;
@@ -120,6 +124,10 @@ pub mod prelude {
     pub use mentedb_core::memory::MemoryType;
     pub use mentedb_core::types::*;
     pub use mentedb_core::{MemoryEdge, MemoryNode, MemoryTier, MenteError};
+    pub use mentedb_sqlite::{
+        EntityAlias, EntityRecord, MemoryEntityLink, MemoryOperation, MemorySource,
+        RetrievalConfig, RetrievalTrace, RetrievalTraceHit,
+    };
 
     pub use crate::MenteDb;
 }
@@ -353,18 +361,20 @@ impl MenteDb {
         // Hydrate the in-memory graph from the SQLite edge store (source of
         // truth) and register every memory as a graph node.
         let graph = GraphManager::new();
-        for id in db.all_memory_ids()? {
-            graph.add_memory(id);
+        let memory_ids = db.all_memory_ids()?;
+        for id in &memory_ids {
+            graph.add_memory(*id);
         }
         for edge in db.all_edges()? {
             // add_relationship persists nothing here; SQLite already holds the
             // edge. We mirror it into the CSR for the graph algorithms.
             let _ = graph.add_relationship(&edge);
         }
-        if let Ok(ids) = db.all_memory_ids() {
-            if !ids.is_empty() {
-                info!(memories = ids.len(), "hydrated graph from sqlite store");
-            }
+        if !memory_ids.is_empty() {
+            info!(
+                memories = memory_ids.len(),
+                "hydrated graph from sqlite store"
+            );
         }
 
         let write_inference =
@@ -432,7 +442,9 @@ impl MenteDb {
         embedder: Box<dyn EmbeddingProvider>,
     ) -> MenteResult<Self> {
         let mut db = Self::open(path)?;
-        db.embedding_dim = embedder.dimensions();
+        let dim = embedder.dimensions();
+        db.embedding_dim = dim;
+        db.db.ensure_vector_index(dim)?;
         db.embedder = Some(embedder);
         Ok(db)
     }
@@ -513,11 +525,34 @@ impl MenteDb {
         Ok(())
     }
 
-    /// Store multiple memories in a single batch transaction.
-    ///
-    /// Uses a single WAL lock for all writes, avoiding per-write overhead of
-    /// flock acquisition, header reload, and LSN scan. Significantly faster
-    /// for bulk inserts.
+    /// Stores a memory with explicit provenance in the same SQLite transaction.
+    pub fn store_with_source(&self, node: MemoryNode, source: MemorySource) -> MenteResult<()> {
+        let id = node.id;
+        debug!("Storing memory {} with provenance", id);
+
+        if !node.embedding.is_empty() && self.db.embedding_dim() == 0 {
+            self.db.ensure_vector_index(node.embedding.len())?;
+        }
+
+        let dim = self.db.embedding_dim();
+        if dim > 0 && !node.embedding.is_empty() && node.embedding.len() != dim {
+            return Err(MenteError::EmbeddingDimensionMismatch {
+                got: node.embedding.len(),
+                expected: dim,
+            });
+        }
+
+        self.db.store_memory_with_source(&node, &source)?;
+        self.graph.add_memory(id);
+
+        if self.cognitive_config.write_inference {
+            self.run_write_inference(&node);
+        }
+
+        Ok(())
+    }
+
+    /// Store multiple memories in a single SQLite transaction.
     pub fn store_batch(&self, nodes: Vec<MemoryNode>) -> MenteResult<Vec<MemoryId>> {
         // Auto-provision the vector index from the first embedding seen.
         if let Some(first_dim) = nodes.iter().find_map(|n| {
@@ -526,10 +561,9 @@ impl MenteDb {
             } else {
                 Some(n.embedding.len())
             }
-        }) {
-            if self.db.embedding_dim() == 0 {
-                self.db.ensure_vector_index(first_dim)?;
-            }
+        }) && self.db.embedding_dim() == 0
+        {
+            self.db.ensure_vector_index(first_dim)?;
         }
 
         let dim = self.db.embedding_dim();
@@ -734,7 +768,7 @@ impl MenteDb {
     ) -> MenteResult<Vec<(MemoryId, f32)>> {
         use std::collections::HashMap;
 
-        let rrf_k: f32 = 60.0;
+        let rrf_k = self.db.retrieval_config().multi_query_rrf_k;
         let mut rrf_scores: HashMap<MemoryId, f32> = HashMap::new();
 
         let now = std::time::SystemTime::now()
@@ -798,12 +832,101 @@ impl MenteDb {
         self.db.count().unwrap_or(0)
     }
 
+    /// Add or update provenance for an existing memory.
+    pub fn add_memory_source(&self, source: MemorySource) -> MenteResult<()> {
+        self.db.add_memory_source(&source)
+    }
+
+    /// Provenance records for a memory, newest first.
+    pub fn memory_sources(&self, id: MemoryId) -> MenteResult<Vec<MemorySource>> {
+        self.db.memory_sources(id)
+    }
+
+    /// Add or update a canonical entity.
+    pub fn upsert_entity(&self, entity: EntityRecord) -> MenteResult<()> {
+        self.db.upsert_entity(&entity)
+    }
+
+    /// Load an entity by id.
+    pub fn get_entity(&self, entity_id: &str) -> MenteResult<Option<EntityRecord>> {
+        self.db.get_entity(entity_id)
+    }
+
+    /// List canonical entities, newest updated first.
+    pub fn list_entities(&self, limit: usize) -> MenteResult<Vec<EntityRecord>> {
+        self.db.list_entities(limit)
+    }
+
+    /// Add or update an alias in the durable entity table.
+    pub fn upsert_entity_alias(&self, alias: EntityAlias) -> MenteResult<()> {
+        self.db.add_entity_alias(&alias)
+    }
+
+    /// List aliases for an entity.
+    pub fn entity_aliases(&self, entity_id: &str) -> MenteResult<Vec<EntityAlias>> {
+        self.db.entity_aliases(entity_id)
+    }
+
+    /// Resolve canonical entities by alias.
+    pub fn entities_by_alias(&self, alias: &str) -> MenteResult<Vec<EntityRecord>> {
+        self.db.entities_by_alias(alias)
+    }
+
+    /// Link a memory to a canonical entity.
+    pub fn link_memory_entity(&self, link: MemoryEntityLink) -> MenteResult<()> {
+        self.db.link_memory_entity(&link)
+    }
+
+    /// Entity links for one memory.
+    pub fn memory_entity_links(&self, id: MemoryId) -> MenteResult<Vec<MemoryEntityLink>> {
+        self.db.memory_entity_links(id)
+    }
+
+    /// Memory links for one entity.
+    pub fn memories_for_entity(&self, entity_id: &str) -> MenteResult<Vec<MemoryEntityLink>> {
+        self.db.memories_for_entity(entity_id)
+    }
+
+    /// Current retrieval tuning for hybrid and multi-query recall.
+    pub fn retrieval_config(&self) -> RetrievalConfig {
+        self.db.retrieval_config()
+    }
+
+    /// Replace retrieval tuning for future recall calls.
+    pub fn set_retrieval_config(&self, config: RetrievalConfig) {
+        self.db.set_retrieval_config(config);
+    }
+
+    /// Enable or disable persisted retrieval traces.
+    pub fn set_retrieval_tracing(&self, enabled: bool) {
+        self.db.set_retrieval_tracing(enabled);
+    }
+
+    /// Whether persisted retrieval tracing is enabled.
+    pub fn retrieval_tracing_enabled(&self) -> bool {
+        self.db.retrieval_tracing_enabled()
+    }
+
+    /// Recent write-side audit rows, newest first.
+    pub fn recent_memory_operations(&self, limit: usize) -> MenteResult<Vec<MemoryOperation>> {
+        self.db.recent_operations(limit)
+    }
+
+    /// Recent retrieval trace headers, newest first.
+    pub fn recent_retrieval_traces(&self, limit: usize) -> MenteResult<Vec<RetrievalTrace>> {
+        self.db.recent_retrieval_traces(limit)
+    }
+
+    /// Final ranked hits for a persisted retrieval trace.
+    pub fn retrieval_trace_hits(&self, trace_id: &str) -> MenteResult<Vec<RetrievalTraceHit>> {
+        self.db.retrieval_trace_hits(trace_id)
+    }
+
     /// Removes a memory from storage, its vector row, tags, and edges, and
     /// drops it from the in-memory graph.
     pub fn forget(&self, id: MemoryId) -> MenteResult<()> {
         debug!("Forgetting memory {}", id);
-        let _ = self.db.delete_memory(id);
-        let _ = self.db.delete_edges_for(id);
+        let _ = self.db.delete_memory(id)?;
         self.graph.remove_memory(id);
         Ok(())
     }
@@ -967,7 +1090,7 @@ impl MenteDb {
                 reason,
             } => {
                 debug!(
-                    "Contradiction detected: {} vs {} — {}",
+                    "Contradiction detected: {} vs {}: {}",
                     existing, new, reason
                 );
                 let now = std::time::SystemTime::now()
@@ -1214,7 +1337,10 @@ impl MenteDb {
             // and only act if no index exists yet.
             let _ = self.db.ensure_vector_index(dim);
         }
-        info!(indexed = total, total, "index rebuild complete (sqlite indexes are self-maintaining)");
+        info!(
+            indexed = total,
+            total, "index rebuild complete (sqlite indexes are self-maintaining)"
+        );
         Ok(total)
     }
 
@@ -1271,10 +1397,14 @@ impl MenteDb {
                 let scored: Vec<ScoredMemory> = ids
                     .iter()
                     .filter_map(|id| {
-                        self.db.get_memory(*id).ok().flatten().map(|node| ScoredMemory {
-                            memory: node,
-                            score: 1.0,
-                        })
+                        self.db
+                            .get_memory(*id)
+                            .ok()
+                            .flatten()
+                            .map(|node| ScoredMemory {
+                                memory: node,
+                                score: 1.0,
+                            })
                     })
                     .collect();
                 Ok(scored)
@@ -1319,7 +1449,7 @@ impl MenteDb {
                         now,
                     );
                     // Blend search similarity with decayed salience.
-                    // 70% similarity, 30% salience — keeps search relevance
+                    // 70% similarity, 30% salience, keeps search relevance
                     // primary but rewards recently active memories.
                     score * 0.7 + decayed_salience * 0.3
                 } else {
@@ -1346,7 +1476,7 @@ impl MenteDb {
     // Cognitive Engine: Pain Registry
     // -----------------------------------------------------------------------
 
-    /// Record a pain signal — a recurring failure or frustration pattern.
+    /// Record a pain signal, a recurring failure or frustration pattern.
     ///
     /// Pain signals are tracked by keywords and surfaced as warnings when
     /// similar contexts arise in future queries.
@@ -1456,7 +1586,7 @@ impl MenteDb {
     // Cognitive Engine: Phantom Tracking
     // -----------------------------------------------------------------------
 
-    /// Detect phantom memories — entities referenced in content but not stored.
+    /// Detect phantom memories, entities referenced in content but not stored.
     ///
     /// Scans content for entity mentions that don't exist in the known entities
     /// list, flagging them as knowledge gaps that should be filled.
@@ -1667,7 +1797,7 @@ impl MenteDb {
 
     /// Run archival evaluation on all memories in the database.
     ///
-    /// Returns decisions for each memory. Does NOT apply them — call
+    /// Returns decisions for each memory. Does NOT apply them, call
     /// `invalidate_memory` or `forget` to act on the decisions.
     pub fn evaluate_archival_global(&self) -> MenteResult<Vec<(MemoryId, ArchivalDecision)>> {
         let now = std::time::SystemTime::now()
@@ -1840,13 +1970,10 @@ impl MenteDb {
                             if existing.len() < 300 {
                                 existing.push_str(" | ");
                                 let remaining = 500usize.saturating_sub(existing.len());
-                                existing
-                                    .push_str(&mem.content[..mem.content.len().min(remaining)]);
+                                existing.push_str(&mem.content[..mem.content.len().min(remaining)]);
                             }
                         })
-                        .or_insert_with(|| {
-                            mem.content[..mem.content.len().min(300)].to_string()
-                        });
+                        .or_insert_with(|| mem.content[..mem.content.len().min(300)].to_string());
                     break;
                 }
             }
@@ -1985,7 +2112,7 @@ impl MenteDb {
 
     /// Link entities using only the sync EntityResolver (cache + rules, no LLM).
     ///
-    /// This is the fast path — links entities that are already known to be
+    /// This is the fast path, links entities that are already known to be
     /// the same from previous LLM resolutions. For full LLM-powered resolution,
     /// use `unresolved_entity_names()` + `apply_entity_link_resolutions()`.
     pub fn link_entities(&self) -> MenteResult<EntityLinkResult> {

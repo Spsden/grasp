@@ -1,4 +1,4 @@
-//! Integration tests for the MenteDB storage engine.
+//! Integration tests for the SQLite-backed compatibility storage facade.
 
 use mentedb_core::MemoryNode;
 use mentedb_core::memory::MemoryType;
@@ -17,9 +17,10 @@ fn test_store_and_load_memory() {
         vec![0.1, 0.2, 0.3, 0.4],
     );
 
-    let page_id = engine.store_memory(&node).unwrap();
-    let loaded = engine.load_memory(page_id).unwrap();
+    let storage_id = engine.store_memory(&node).unwrap();
+    let loaded = engine.load_memory(storage_id).unwrap();
 
+    assert_eq!(storage_id, node.id);
     assert_eq!(node.id, loaded.id);
     assert_eq!(node.content, loaded.content);
     assert_eq!(node.embedding, loaded.embedding);
@@ -43,13 +44,10 @@ fn test_multiple_memories() {
         })
         .collect();
 
-    let page_ids: Vec<_> = nodes
-        .iter()
-        .map(|n| engine.store_memory(n).unwrap())
-        .collect();
+    let storage_ids = engine.store_memory_batch(&nodes).unwrap();
 
-    for (node, pid) in nodes.iter().zip(page_ids.iter()) {
-        let loaded = engine.load_memory(*pid).unwrap();
+    for (node, storage_id) in nodes.iter().zip(storage_ids.iter()) {
+        let loaded = engine.load_memory(*storage_id).unwrap();
         assert_eq!(node.id, loaded.id);
         assert_eq!(node.content, loaded.content);
         assert_eq!(node.embedding, loaded.embedding);
@@ -68,15 +66,14 @@ fn test_persist_across_reopen() {
     );
     let id = node.id;
 
-    let page_id;
     {
         let engine = StorageEngine::open(dir.path()).unwrap();
-        page_id = engine.store_memory(&node).unwrap();
+        engine.store_memory(&node).unwrap();
         engine.close().unwrap();
     }
     {
         let engine = StorageEngine::open(dir.path()).unwrap();
-        let loaded = engine.load_memory(page_id).unwrap();
+        let loaded = engine.load_memory(id).unwrap();
         assert_eq!(loaded.id, id);
         assert_eq!(loaded.content, "persisted memory");
     }
@@ -89,22 +86,21 @@ fn test_checkpoint_and_reload() {
     let node = MemoryNode::new(
         AgentId::new(),
         MemoryType::AntiPattern,
-        "don't use global state".to_string(),
+        "do not use global state".to_string(),
         vec![0.0, 1.0],
     );
     let id = node.id;
 
-    let page_id;
     {
         let engine = StorageEngine::open(dir.path()).unwrap();
-        page_id = engine.store_memory(&node).unwrap();
+        engine.store_memory(&node).unwrap();
         engine.checkpoint().unwrap();
         engine.close().unwrap();
     }
     {
         let engine = StorageEngine::open(dir.path()).unwrap();
-        let loaded = engine.load_memory(page_id).unwrap();
+        let loaded = engine.load_memory(id).unwrap();
         assert_eq!(loaded.id, id);
-        assert_eq!(loaded.content, "don't use global state");
+        assert_eq!(loaded.content, "do not use global state");
     }
 }

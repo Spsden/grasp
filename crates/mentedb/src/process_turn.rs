@@ -368,9 +368,7 @@ impl MenteDb {
             scored.iter().map(|sm| sm.memory.id).collect();
         let always_scope_tag = "scope:always";
         for mem in self.db.all_memories().unwrap_or_default() {
-            if mem.tags.iter().any(|t| t == always_scope_tag)
-                && !hybrid_ids.contains(&mem.id)
-            {
+            if mem.tags.iter().any(|t| t == always_scope_tag) && !hybrid_ids.contains(&mem.id) {
                 scored.push(ScoredMemory {
                     memory: mem,
                     score: 0.85,

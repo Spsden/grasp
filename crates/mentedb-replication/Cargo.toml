@@ -9,7 +9,6 @@ description = "Distributed replication layer using Raft consensus for MenteDB"
 
 [dependencies]
 mentedb-core = { workspace = true }
-mentedb-storage = { workspace = true }
 
 # Raft consensus
 openraft = { version = "0.10.0-alpha.17", features = ["serde"] }

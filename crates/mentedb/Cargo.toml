@@ -12,12 +12,11 @@ categories = ["database-implementations"]
 
 [dependencies]
 mentedb-core = { workspace = true }
-mentedb-storage = { workspace = true }
 mentedb-index = { workspace = true }
 mentedb-graph = { workspace = true }
 mentedb-query = { workspace = true }
 mentedb-context = { workspace = true }
-mentedb-embedding = { workspace = true }
+mentedb-embedding = { workspace = true, features = ["http"] }
 mentedb-cognitive = { workspace = true }
 mentedb-consolidation = { workspace = true }
 mentedb-sqlite = { workspace = true }
@@ -38,6 +37,7 @@ tempfile = { workspace = true }
 criterion = { workspace = true }
 uuid = { workspace = true }
 serde_json = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 [[bench]]
 name = "storage_bench"

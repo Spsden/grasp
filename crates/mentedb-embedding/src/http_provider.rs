@@ -98,6 +98,29 @@ impl HttpEmbeddingConfig {
         }
     }
 
+    /// Create a configuration for Ollama's local embedding API.
+    ///
+    /// Default dimensions are for nomic-embed-text.
+    pub fn ollama(model: impl Into<String>) -> Self {
+        let model = model.into();
+        let dimensions = match model.as_str() {
+            "nomic-embed-text" => 768,
+            "mxbai-embed-large" => 1024,
+            _ => 768,
+        };
+
+        let mut headers = HashMap::new();
+        headers.insert("Content-Type".to_string(), "application/json".to_string());
+
+        Self {
+            api_url: "http://localhost:11434/api/embeddings".to_string(),
+            api_key: "ollama".to_string(),
+            model_name: model,
+            dimensions,
+            headers,
+        }
+    }
+
     /// Override the embedding dimensions.
     pub fn with_dimensions(mut self, dimensions: usize) -> Self {
         self.dimensions = dimensions;
@@ -170,6 +193,28 @@ mod http_impl {
         embedding: Vec<f32>,
     }
 
+    #[derive(Deserialize)]
+    struct OllamaEmbeddingResponse {
+        embedding: Vec<f32>,
+    }
+
+    fn parse_embedding_response(body: &str) -> Result<Vec<f32>, String> {
+        match serde_json::from_str::<OpenAIEmbeddingResponse>(body) {
+            Ok(parsed) => parsed
+                .data
+                .into_iter()
+                .next()
+                .map(|d| d.embedding)
+                .ok_or_else(|| "Empty embedding response".to_string()),
+            Err(openai_err) => match serde_json::from_str::<OllamaEmbeddingResponse>(body) {
+                Ok(parsed) => Ok(parsed.embedding),
+                Err(ollama_err) => Err(format!(
+                    "Failed to parse embedding response as OpenAI ({openai_err}) or Ollama ({ollama_err})"
+                )),
+            },
+        }
+    }
+
     impl HttpEmbeddingProvider {
         /// Create a ureq agent with a 60-second global timeout to prevent hangs.
         fn agent(&self) -> ureq::Agent {
@@ -188,14 +233,22 @@ mod http_impl {
                     std::thread::sleep(std::time::Duration::from_millis(500 * (1 << attempt)));
                 }
 
-                let body = json!({
-                    "model": self.config.model_name,
-                    "input": text,
-                });
+                let body = if self.config.api_key == "ollama" {
+                    json!({
+                        "model": self.config.model_name,
+                        "prompt": text,
+                    })
+                } else {
+                    json!({
+                        "model": self.config.model_name,
+                        "input": text,
+                    })
+                };
 
-                let mut req = agent
-                    .post(&self.config.api_url)
-                    .header("Authorization", &format!("Bearer {}", self.config.api_key));
+                let mut req = agent.post(&self.config.api_url);
+                if self.config.api_key != "ollama" {
+                    req = req.header("Authorization", &format!("Bearer {}", self.config.api_key));
+                }
 
                 for (k, v) in &self.config.headers {
                     if k.to_lowercase() != "content-type" {
@@ -204,19 +257,13 @@ mod http_impl {
                 }
 
                 match req.send_json(&body) {
-                    Ok(mut resp) => match resp.body_mut().read_json::<OpenAIEmbeddingResponse>() {
-                        Ok(parsed) => {
-                            return parsed
-                                .data
-                                .into_iter()
-                                .next()
-                                .map(|d| d.embedding)
-                                .ok_or_else(|| {
-                                    MenteError::Storage("Empty embedding response".to_string())
-                                });
-                        }
+                    Ok(mut resp) => match resp.body_mut().read_to_string() {
+                        Ok(response_body) => match parse_embedding_response(&response_body) {
+                            Ok(embedding) => return Ok(embedding),
+                            Err(e) => last_err = Some(e),
+                        },
                         Err(e) => {
-                            last_err = Some(format!("Failed to parse embedding response: {}", e));
+                            last_err = Some(format!("Failed to read embedding response body: {e}"));
                         }
                     },
                     Err(e) => {
@@ -235,6 +282,13 @@ mod http_impl {
             texts: &[&str],
             max_attempts: u32,
         ) -> MenteResult<Vec<Vec<f32>>> {
+            if self.config.api_key == "ollama" {
+                return texts
+                    .iter()
+                    .map(|text| self.embed_with_retry(text, max_attempts))
+                    .collect();
+            }
+
             let agent = self.agent();
             let mut last_err = None;
             for attempt in 0..max_attempts {
@@ -247,9 +301,10 @@ mod http_impl {
                     "input": texts,
                 });
 
-                let mut req = agent
-                    .post(&self.config.api_url)
-                    .header("Authorization", &format!("Bearer {}", self.config.api_key));
+                let mut req = agent.post(&self.config.api_url);
+                if self.config.api_key != "ollama" {
+                    req = req.header("Authorization", &format!("Bearer {}", self.config.api_key));
+                }
 
                 for (k, v) in &self.config.headers {
                     if k.to_lowercase() != "content-type" {

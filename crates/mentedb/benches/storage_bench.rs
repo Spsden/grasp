@@ -3,7 +3,7 @@ use mentedb::context::{AssemblyConfig, ContextAssembler, ScoredMemory};
 use mentedb::core::memory::{MemoryNode, MemoryType};
 use mentedb::index::hnsw::{HnswConfig, HnswIndex};
 use mentedb::query::mql::Mql;
-use mentedb::storage::StorageEngine;
+use mentedb::sqlite::Backend;
 use mentedb_core::types::{AgentId, MemoryId};
 
 fn random_embedding(dim: usize) -> Vec<f32> {
@@ -46,15 +46,15 @@ fn bench_storage_write(c: &mut Criterion) {
         b.iter_with_setup(
             || {
                 let dir = tempfile::tempdir().unwrap();
-                let engine = StorageEngine::open(dir.path()).unwrap();
+                let db_path = dir.path().join("bench.sqlite");
+                let engine = Backend::open(&db_path, 128).unwrap();
                 let memories: Vec<MemoryNode> = (0..1000).map(make_memory).collect();
                 (dir, engine, memories)
             },
-            |(_dir, mut engine, memories)| {
+            |(_dir, engine, memories)| {
                 for mem in &memories {
                     black_box(engine.store_memory(mem).unwrap());
                 }
-                engine.close().unwrap();
             },
         );
     });

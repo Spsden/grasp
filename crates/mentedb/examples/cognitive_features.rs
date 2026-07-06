@@ -11,16 +11,20 @@ use mentedb_core::types::{MemoryId, Timestamp};
 
 fn main() {
     println!("=== Stream Cognition ===\n");
-    demonstrate_stream_cognition();
 
-    println!("\n=== Trajectory Tracking ===\n");
-    demonstrate_trajectory_tracking();
+    //TODO : Make better version of this heuristic...
+    // demonstrate_stream_cognition();
+
+    // demonstrate_stream_cognition_sps();
+
+    // println!("\n=== Trajectory Tracking ===\n");
+    // demonstrate_trajectory_tracking();
 
     println!("\n=== Phantom Memory Detection ===\n");
     demonstrate_phantom_detection();
 
-    println!("\n=== Pain Signals ===\n");
-    demonstrate_pain_signals();
+    // println!("\n=== Pain Signals ===\n");
+    // demonstrate_pain_signals();
 }
 
 /// Feed tokens into the cognition stream and check for alerts.
@@ -32,10 +36,14 @@ fn demonstrate_stream_cognition() {
     let stream = CognitionStream::new(256);
 
     // Simulate an LLM generating tokens.
-    let tokens = ["The", "user", "prefers", "light", "mode", "in", "editors"];
-    for token in &tokens {
-        stream.feed_token(token);
-    }
+    let tokens = [
+        "The", " user", " prefers", " light", " mode", " in", " editors",
+    ];
+    // for token in &tokens {
+    //     stream.feed_token(token);
+    // }
+
+    stream.feed_token("The user prefers light mode in editors.");
 
     // Check the buffered output against known facts.
     // The stored fact says "dark mode" but the LLM said "light mode."
@@ -238,4 +246,51 @@ fn demonstrate_pain_signals() {
 
     let still_relevant = registry.get_pain_for_context(&context_keywords);
     println!("Pain signals still active: {}", still_relevant.len());
+}
+
+fn demonstrate_stream_cognition_sps() {
+    let stream = CognitionStream::new(256);
+
+    // Feed tokens that contradict a stored fact.
+    // let tokens = [
+    //     "The",
+    //     "system",
+    //     "does",
+    //     "not",
+    //     "use",
+    //     "PostgreSQL",
+    //     "it",
+    //     "uses",
+    //     "MySQL",
+    // ];
+
+    // for token in &tokens {
+    //     stream.feed_token(token);
+    // }
+
+    stream.feed_token("The system won't use PostgreSQL. It uses MySQL.");
+
+    let known_facts = vec![(
+        mentedb_core::types::MemoryId::new(),
+        "The system uses PostgreSQL for storage".to_string(),
+    )];
+
+    let alerts = stream.check_alerts(&known_facts);
+
+    for alert in alerts {
+        match alert {
+            StreamAlert::Contradiction {
+                ai_said, stored, ..
+            } => {
+                println!("Contradiction detected!");
+                println!("AI said: {}", ai_said);
+                println!("Stored fact: {}", stored);
+            }
+            _ => {}
+        }
+    }
+
+    // Drain the token buffer.
+    let buffered = stream.drain_buffer();
+    println!("Buffered text: '{}'", buffered);
 }

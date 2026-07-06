@@ -1,0 +1,22 @@
+Turn 1 user message: "How do we test our code?"
+  → Retrieve: [A, B, C]  (all score > threshold)
+
+Turn 2 user message: "What's our database backend?"
+  → Retrieve: [A, B, D]  (C doesn't match; D does)
+
+Delta: {added: [D], removed: [C]}
+
+Client builds prompt with A, B, D (because MenteDB said they're relevant)
+
+
+
+
+
+
+
+cargo run -p mentedb --example pratap_memory_drift -- \
+  --turn-mode mimic-flutter \
+  --embedding-provider ollama \
+  --embedding-model nomic-embed-text:latest \
+  --db-dir /Volumes/Fatboi/mentedb-grasp/benchmarks/test_db \
+  --output /Volumes/Fatboi/mentedb-grasp/benchmarks/results/pratap_memory_drift-ollama-nomic.jsonl

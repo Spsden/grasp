@@ -16,7 +16,6 @@ import argparse
 import json
 import os
 import re
-import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -28,6 +27,25 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_FIXTURE = REPO_ROOT / "benchmarks" / "fixtures" / "pratap_synapse_memory.json"
 DEFAULT_RESULTS_DIR = REPO_ROOT / "benchmarks" / "results"
+DEFAULT_DB_DIR = REPO_ROOT / "benchmarks" / "test-db"
+DEFAULT_ENV_FILE = REPO_ROOT / ".env"
+
+
+def load_env_file(path: Path = DEFAULT_ENV_FILE) -> None:
+    """Load simple KEY=VALUE entries without requiring python-dotenv."""
+    if not path.exists():
+        return
+
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("'\"")
+        if key and key not in os.environ:
+            os.environ[key] = value
 
 
 @dataclass(frozen=True)
@@ -55,12 +73,12 @@ def parse_args() -> argparse.Namespace:
         "--db-dir",
         type=Path,
         default=None,
-        help="MenteDB data directory. Defaults to a temporary directory.",
+        help="MenteDB data directory. Defaults to benchmarks/test-db.",
     )
     parser.add_argument(
         "--keep-db",
         action="store_true",
-        help="Keep the temporary database directory after the run.",
+        help="Kept for compatibility. The default benchmark DB is already persistent.",
     )
     parser.add_argument(
         "--dry-run",
@@ -358,7 +376,7 @@ def run(args: argparse.Namespace) -> int:
     if args.dry_run:
         return dry_run(fixture)
 
-    db_dir = args.db_dir or Path(tempfile.mkdtemp(prefix="mentedb-pratap-bench-"))
+    db_dir = args.db_dir or DEFAULT_DB_DIR
     output = args.output or default_output_path(fixture)
     output.parent.mkdir(parents=True, exist_ok=True)
     settings = fixture.get("settings", {})
@@ -497,22 +515,16 @@ def run(args: argparse.Namespace) -> int:
             f"Context pass rate: {passed}/{len(records)} "
             f"({(passed / len(records) * 100) if records else 0:.1f}%)"
         )
-        if args.keep_db or args.db_dir is not None:
-            print(f"DB kept at: {db_dir}")
-        else:
-            print(f"Temporary DB will be removed after close: {db_dir}")
+        print(f"DB kept at: {db_dir}")
         return 0 if passed == len(records) else 1
     finally:
         close = getattr(db, "close", None)
         if callable(close):
             close()
-        if not args.keep_db and args.db_dir is None:
-            import shutil
-
-            shutil.rmtree(db_dir, ignore_errors=True)
 
 
 def main() -> None:
+    load_env_file()
     raise SystemExit(run(parse_args()))
 
 

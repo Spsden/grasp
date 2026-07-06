@@ -108,6 +108,56 @@ fn now_us() -> Timestamp {
         .as_micros() as Timestamp
 }
 
+fn build_embedding_provider(
+    data_dir: &str,
+    embedding_provider: Option<&str>,
+    embedding_api_key: Option<&str>,
+    embedding_model: Option<&str>,
+) -> PyResult<Option<Box<dyn EmbeddingProvider>>> {
+    match embedding_provider {
+        Some("openai") => {
+            let key = embedding_api_key.ok_or_else(|| {
+                PyRuntimeError::new_err("openai provider requires embedding_api_key")
+            })?;
+            let model = embedding_model.unwrap_or("text-embedding-3-small");
+            let config = HttpEmbeddingConfig::openai(key, model);
+            Ok(Some(Box::new(HttpEmbeddingProvider::new(config))))
+        }
+        Some("cohere") => {
+            let key = embedding_api_key.ok_or_else(|| {
+                PyRuntimeError::new_err("cohere provider requires embedding_api_key")
+            })?;
+            let model = embedding_model.unwrap_or("embed-english-v3.0");
+            let config = HttpEmbeddingConfig::cohere(key, model);
+            Ok(Some(Box::new(HttpEmbeddingProvider::new(config))))
+        }
+        Some("voyage") => {
+            let key = embedding_api_key.ok_or_else(|| {
+                PyRuntimeError::new_err("voyage provider requires embedding_api_key")
+            })?;
+            let model = embedding_model.unwrap_or("voyage-2");
+            let config = HttpEmbeddingConfig::voyage(key, model);
+            Ok(Some(Box::new(HttpEmbeddingProvider::new(config))))
+        }
+        Some("ollama") => {
+            let model = embedding_model.unwrap_or("nomic-embed-text");
+            let config = HttpEmbeddingConfig::ollama(model);
+            Ok(Some(Box::new(HttpEmbeddingProvider::new(config))))
+        }
+        Some("candle") | Some("local") => {
+            let cache_dir = std::path::PathBuf::from(format!("{data_dir}/.candle-cache"));
+            match CandleEmbeddingProvider::with_cache_dir(cache_dir) {
+                Ok(p) => Ok(Some(Box::new(p))),
+                Err(e) => Err(PyRuntimeError::new_err(format!("candle init failed: {e}"))),
+            }
+        }
+        Some("hash") | None => Ok(Some(Box::new(HashEmbeddingProvider::new(384)))),
+        Some(other) => Err(PyRuntimeError::new_err(format!(
+            "unknown embedding provider: {other}. Use 'openai', 'ollama', 'candle', 'cohere', 'voyage', or 'hash'"
+        ))),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // MenteDB
 // ---------------------------------------------------------------------------
@@ -129,52 +179,15 @@ impl MenteDB {
         embedding_api_key: Option<&str>,
         embedding_model: Option<&str>,
     ) -> PyResult<Self> {
-        let embedder: Option<Box<dyn EmbeddingProvider>> = match embedding_provider {
-            Some("openai") => {
-                let key = embedding_api_key.ok_or_else(|| {
-                    PyRuntimeError::new_err("openai provider requires embedding_api_key")
-                })?;
-                let model = embedding_model.unwrap_or("text-embedding-3-small");
-                let config = HttpEmbeddingConfig::openai(key, model);
-                Some(Box::new(HttpEmbeddingProvider::new(config)))
-            }
-            Some("cohere") => {
-                let key = embedding_api_key.ok_or_else(|| {
-                    PyRuntimeError::new_err("cohere provider requires embedding_api_key")
-                })?;
-                let model = embedding_model.unwrap_or("embed-english-v3.0");
-                let config = HttpEmbeddingConfig::cohere(key, model);
-                Some(Box::new(HttpEmbeddingProvider::new(config)))
-            }
-            Some("voyage") => {
-                let key = embedding_api_key.ok_or_else(|| {
-                    PyRuntimeError::new_err("voyage provider requires embedding_api_key")
-                })?;
-                let model = embedding_model.unwrap_or("voyage-2");
-                let config = HttpEmbeddingConfig::voyage(key, model);
-                Some(Box::new(HttpEmbeddingProvider::new(config)))
-            }
-            Some("candle") | Some("local") => {
-                let cache_dir = std::path::PathBuf::from(format!("{data_dir}/.candle-cache"));
-                match CandleEmbeddingProvider::with_cache_dir(cache_dir) {
-                    Ok(p) => Some(Box::new(p)),
-                    Err(e) => {
-                        return Err(PyRuntimeError::new_err(format!("candle init failed: {e}")));
-                    }
-                }
-            }
-            Some("hash") | None => Some(Box::new(HashEmbeddingProvider::new(384))),
-            Some(other) => {
-                return Err(PyRuntimeError::new_err(format!(
-                    "unknown embedding provider: {other}. Use 'openai', 'candle', 'cohere', 'voyage', or 'hash'"
-                )));
-            }
-        };
+        let embedder =
+            build_embedding_provider(data_dir, embedding_provider, embedding_api_key, embedding_model)?;
+        let db_embedder =
+            build_embedding_provider(data_dir, embedding_provider, embedding_api_key, embedding_model)?;
 
         let mut db = MenteDb::open_with_config(Path::new(data_dir), CognitiveConfig::default())
             .map_err(to_pyerr)?;
-        if let Some(ref e) = embedder {
-            db.set_embedder(Box::new(HashEmbeddingProvider::new(e.dimensions())));
+        if let Some(e) = db_embedder {
+            db.set_embedder(e);
         }
         Ok(Self {
             db: Some(db),

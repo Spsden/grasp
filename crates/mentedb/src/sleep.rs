@@ -221,10 +221,7 @@ impl MenteDb {
         }
     }
 
-    fn load_sleep_maintenance_memories(
-        &self,
-        max_memories: usize,
-    ) -> Vec<(MemoryId, MemoryNode)> {
+    fn load_sleep_maintenance_memories(&self, max_memories: usize) -> Vec<(MemoryId, MemoryNode)> {
         if max_memories == 0 {
             return Vec::new();
         }
