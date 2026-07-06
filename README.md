@@ -1,14 +1,14 @@
-# MenteDB
+# Grasp
 
 > Beta. This fork is under active development for Synapse style AI memory. APIs,
 > schemas, and crate boundaries may change while the memory layer is hardened.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
-MenteDB is a Rust memory engine for AI agents. This branch is a SQLite backed
-evolution of the original project: durable memory rows live in SQLite, vector
-search is handled by `sqlite-vec`, keyword search uses FTS5, graph and entity
-links are inspectable SQL rows, and retrieval can be traced for debugging.
+Grasp is a Rust memory engine for AI agents. It is a SQLite backed evolution of
+the original MenteDB project: durable memory rows live in SQLite, vector search
+is handled by `sqlite-vec`, keyword search uses FTS5, graph and entity links are
+inspectable SQL rows, and retrieval can be traced for debugging.
 
 The product goal is a memory layer that is useful in real agent systems: easy to
 inspect, easy to rebuild, traceable when recall fails, and flexible enough to add
@@ -49,7 +49,8 @@ and rationale.
 - Retrieval tracing for debugging recall.
 - Deterministic surface entity linking for explicit tags and structured fields.
 - Entity-aware recall boost using stored aliases and memory links.
-- Cognitive facade APIs through `MenteDb`.
+- Cognitive facade APIs through the current Rust facade, still named `MenteDb`
+  until crate/API renaming is completed.
 - REST and gRPC server crates remain in the workspace.
 - Python and TypeScript SDK folders remain present, although they may need
   follow-up updates before publishing from this fork.
@@ -183,7 +184,7 @@ ORDER BY rank_position ASC;
 
 ```mermaid
 graph TD
-    APP["Agent or app"] --> FACADE["MenteDb facade"]
+    APP["Agent or app"] --> FACADE["current Rust facade"]
     FACADE --> EMBED["Embedding provider"]
     FACADE --> SQLITE["SQLite durable store"]
     SQLITE --> MEM["memories"]
@@ -210,20 +211,20 @@ Recall is currently a blend of:
 
 | Crate | Role |
 |-------|------|
-| `mentedb` | main facade and orchestration |
-| `mentedb-sqlite` | SQLite, sqlite-vec, FTS5, graph rows, provenance, trace tables |
-| `mentedb-core` | core types, ids, errors, memory and edge models |
-| `mentedb-cognitive` | write inference, entity resolution, pain, phantom, speculative features |
-| `mentedb-consolidation` | decay, compression, consolidation, archival, forget helpers |
-| `mentedb-context` | context assembly, U curve layout, delta tracking |
-| `mentedb-embedding` | embedding provider abstraction and providers |
-| `mentedb-extraction` | LLM extraction support, still evolving |
-| `mentedb-graph` | in-memory graph algorithms used by cognitive features |
-| `mentedb-index` | legacy and algorithmic index structures still present in workspace |
-| `mentedb-query` | MQL parser and planner |
-| `mentedb-server` | REST and gRPC server |
-| `mentedb-storage` | compatibility storage crate, currently simplified after SQLite move |
-| `mentedb-replication` | experimental Raft replication layer |
+| `mentedb` | main facade and orchestration, pending rename |
+| `mentedb-sqlite` | SQLite, sqlite-vec, FTS5, graph rows, provenance, trace tables, pending rename |
+| `mentedb-core` | core types, ids, errors, memory and edge models, pending rename |
+| `mentedb-cognitive` | write inference, entity resolution, pain, phantom, speculative features, pending rename |
+| `mentedb-consolidation` | decay, compression, consolidation, archival, forget helpers, pending rename |
+| `mentedb-context` | context assembly, U curve layout, delta tracking, pending rename |
+| `mentedb-embedding` | embedding provider abstraction and providers, pending rename |
+| `mentedb-extraction` | LLM extraction support, still evolving, pending rename |
+| `mentedb-graph` | in-memory graph algorithms used by cognitive features, pending rename |
+| `mentedb-index` | legacy and algorithmic index structures still present in workspace, pending rename |
+| `mentedb-query` | MQL parser and planner, pending rename |
+| `mentedb-server` | REST and gRPC server, pending rename |
+| `mentedb-storage` | compatibility storage crate, currently simplified after SQLite move, pending rename |
+| `mentedb-replication` | experimental Raft replication layer, pending rename |
 
 ## Configuration
 
@@ -275,8 +276,8 @@ configuration before exposing this fork in production.
 
 ## Repository Status
 
-This repository is currently being adapted for Synapse style memory work. Before
-publishing packages or using this as a public product, update:
+This repository is currently being adapted as Grasp for Synapse style memory
+work. Before publishing packages or using this as a public product, update:
 
 - repository URLs
 - package names if the product is renamed
@@ -289,7 +290,7 @@ publishing packages or using this as a public product, update:
 
 ## Attribution
 
-This project is derived from the original MenteDB project by Nam Rodriguez.
+Grasp is derived from the original MenteDB project by Nam Rodriguez.
 
 Original project metadata in the upstream code identified:
 
