@@ -6,7 +6,7 @@ use mentedb_embedding::provider::EmbeddingProvider;
 use crate::config::ExtractionConfig;
 use crate::error::ExtractionError;
 use crate::provider::ExtractionProvider;
-use crate::schema::{ExtractedEntity, ExtractedMemory, ExtractionResult};
+use crate::schema::{ExtractedEntity, ExtractedMemory, ExtractedRelationship, ExtractionResult};
 
 /// Findings from cognitive checks (contradiction detection).
 #[derive(Debug, Clone)]
@@ -51,6 +51,8 @@ pub struct ProcessedExtractionResult {
     pub contradictions: Vec<(ExtractedMemory, Vec<CognitiveFinding>)>,
     /// Entities extracted from the conversation.
     pub entities: Vec<ExtractedEntity>,
+    /// Relationships extracted from the conversation.
+    pub relationships: Vec<ExtractedRelationship>,
     /// Summary statistics.
     pub stats: ExtractionStats,
 }
@@ -104,12 +106,15 @@ impl<P: ExtractionProvider> ExtractionPipeline<P> {
                     if let Ok(verify_result) = self.parse_extraction_response(&verify_response) {
                         let new_memories = verify_result.memories.len();
                         let new_entities = verify_result.entities.len();
+                        let new_relationships = verify_result.relationships.len();
                         result.memories.extend(verify_result.memories);
                         result.entities.extend(verify_result.entities);
-                        if new_memories > 0 || new_entities > 0 {
+                        result.relationships.extend(verify_result.relationships);
+                        if new_memories > 0 || new_entities > 0 || new_relationships > 0 {
                             tracing::info!(
                                 new_memories,
                                 new_entities,
+                                new_relationships,
                                 "verification pass found additional extractions"
                             );
                         }
@@ -145,6 +150,7 @@ impl<P: ExtractionProvider> ExtractionPipeline<P> {
             return Ok(ExtractionResult {
                 memories: vec![],
                 entities: vec![],
+                relationships: vec![],
             });
         }
 
@@ -198,6 +204,7 @@ impl<P: ExtractionProvider> ExtractionPipeline<P> {
             return Ok(ExtractionResult {
                 memories: vec![],
                 entities: vec![],
+                relationships: vec![],
             });
         };
 
@@ -358,6 +365,7 @@ impl<P: ExtractionProvider> ExtractionPipeline<P> {
         let full_result = self.extract_full(conversation).await?;
         let all_memories = full_result.memories;
         let entities = full_result.entities;
+        let relationships = full_result.relationships;
         let total_extracted = all_memories.len();
 
         let quality_passed = self.filter_quality(&all_memories);
@@ -413,6 +421,7 @@ impl<P: ExtractionProvider> ExtractionPipeline<P> {
             rejected_duplicate,
             contradictions,
             entities,
+            relationships,
             stats,
         })
     }

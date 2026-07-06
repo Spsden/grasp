@@ -157,6 +157,13 @@ Examples:
 
 CRITICAL: Resolve holidays and relative dates to specific dates in entity attributes.
 
+RELATIONSHIP EXTRACTION:
+Also extract typed relationships between entities when the conversation supports them.
+Use short stable relation labels such as uses, owns, attends, works_at, built_with,
+member_of, located_at, caused_by, prefers, manages, or knows.
+Every relationship MUST include evidence text from the conversation. Do not infer
+relationships that are not supported by explicit or strongly implied evidence.
+
 OUTPUT FORMAT (strict JSON, no markdown fences):
 {
   "memories": [
@@ -180,10 +187,22 @@ OUTPUT FORMAT (strict JSON, no markdown fences):
         "owner": "user"
       }
     }
+  ],
+  "relationships": [
+    {
+      "source": "Synapse",
+      "target": "Flutter",
+      "relation_type": "uses",
+      "confidence": 0.9,
+      "evidence": "Pratap is building Synapse in Flutter",
+      "attributes": {
+        "context": "tech_stack"
+      }
+    }
   ]
 }
 
-If the conversation contains nothing worth remembering, return: {"memories": [], "entities": []}"#
+If the conversation contains nothing worth remembering, return: {"memories": [], "entities": [], "relationships": []}"#
 }
 
 /// Returns a verification prompt for the second extraction pass.
@@ -206,7 +225,7 @@ Your job: Re-read the conversation and find ANYTHING the first pass MISSED. Focu
 
 IMPORTANT: Do NOT re-extract facts already in the first pass. Only extract NEW facts that were missed.
 
-If the first pass was thorough and nothing was missed, return: {{"memories": [], "entities": []}}
+If the first pass was thorough and nothing was missed, return: {{"memories": [], "entities": [], "relationships": []}}
 
 Use the SAME output format as the first pass:
 {{
@@ -225,6 +244,16 @@ Use the SAME output format as the first pass:
     {{
       "name": "...",
       "entity_type": "person|pet|place|event|item|organization|account",
+      "attributes": {{}}
+    }}
+  ],
+  "relationships": [
+    {{
+      "source": "...",
+      "target": "...",
+      "relation_type": "...",
+      "confidence": 0.7,
+      "evidence": "...",
       "attributes": {{}}
     }}
   ]

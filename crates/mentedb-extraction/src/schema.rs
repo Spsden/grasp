@@ -28,6 +28,9 @@ pub struct ExtractionResult {
     /// Each entity represents a person, pet, place, event, item, etc.
     #[serde(default)]
     pub entities: Vec<ExtractedEntity>,
+    /// Typed relationships between extracted entities.
+    #[serde(default)]
+    pub relationships: Vec<ExtractedRelationship>,
 }
 
 /// An entity extracted from a conversation — a person, pet, place, event, or item
@@ -41,6 +44,26 @@ pub struct ExtractedEntity {
     /// Key-value attributes discovered about this entity.
     /// Keys are attribute names (e.g., "breed", "location", "date"),
     /// values are the attribute values (e.g., "Golden Retriever", "downtown", "February 14th").
+    #[serde(default, deserialize_with = "deserialize_string_map")]
+    pub attributes: HashMap<String, String>,
+}
+
+/// A typed relationship extracted between two entities.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtractedRelationship {
+    /// Canonical source entity name.
+    pub source: String,
+    /// Canonical target entity name.
+    pub target: String,
+    /// Stable relation label, for example "uses", "owns", or "works_at".
+    pub relation_type: String,
+    /// Confidence that this relationship is supported by the conversation.
+    #[serde(default = "default_confidence")]
+    pub confidence: f32,
+    /// Exact or near-exact text supporting the relationship.
+    #[serde(default)]
+    pub evidence: String,
+    /// Additional structured attributes from the extractor.
     #[serde(default, deserialize_with = "deserialize_string_map")]
     pub attributes: HashMap<String, String>,
 }
