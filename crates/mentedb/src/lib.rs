@@ -1174,6 +1174,15 @@ impl MenteDb {
         self.db.recent_operations(limit)
     }
 
+    /// Write-side audit rows that mention a memory, newest first.
+    pub fn memory_operations_for(
+        &self,
+        id: MemoryId,
+        limit: usize,
+    ) -> MenteResult<Vec<MemoryOperation>> {
+        self.db.operations_for_memory(id, limit)
+    }
+
     /// Recent retrieval trace headers, newest first.
     pub fn recent_retrieval_traces(&self, limit: usize) -> MenteResult<Vec<RetrievalTrace>> {
         self.db.recent_retrieval_traces(limit)

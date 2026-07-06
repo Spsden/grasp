@@ -86,6 +86,7 @@ pub struct RetrievalTrace {
     pub time_range: Option<(Timestamp, Timestamp)>,
     pub candidate_count: usize,
     pub result_count: usize,
+    pub config_json: String,
     pub stage_json: String,
     pub created_at: Timestamp,
 }
@@ -3358,6 +3359,46 @@ impl Backend {
         Ok(out)
     }
 
+    /// Write-side audit rows that mention a memory, newest first.
+    pub fn operations_for_memory(
+        &self,
+        id: MemoryId,
+        limit: usize,
+    ) -> Result<Vec<MemoryOperation>, MenteError> {
+        let memory_id = id.to_string();
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT operation_id, operation_type, memory_id, source, target,
+                       payload_json, created_at
+                FROM memory_operations
+                WHERE memory_id = ?1 OR source = ?1 OR target = ?1
+                ORDER BY created_at DESC
+                LIMIT ?2
+                "#,
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![memory_id, usize_to_i64(limit)?], |row| {
+                Ok(MemoryOperation {
+                    operation_id: row.get(0)?,
+                    operation_type: row.get(1)?,
+                    memory_id: parse_optional_memory_id(row.get(2)?),
+                    source: parse_optional_memory_id(row.get(3)?),
+                    target: parse_optional_memory_id(row.get(4)?),
+                    payload_json: row.get(5)?,
+                    created_at: row.get::<_, i64>(6)? as Timestamp,
+                })
+            })
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(store_err)?);
+        }
+        Ok(out)
+    }
+
     /// Recent persisted retrieval traces, newest first.
     pub fn recent_retrieval_traces(&self, limit: usize) -> Result<Vec<RetrievalTrace>, MenteError> {
         let conn = self.conn.lock();
@@ -3366,7 +3407,7 @@ impl Backend {
                 r#"
                 SELECT trace_id, query_text, query_embedding_dim, k, fetch_k,
                        tags_json, tags_or, time_start, time_end,
-                       candidate_count, result_count, stage_json, created_at
+                       candidate_count, result_count, config_json, stage_json, created_at
                 FROM retrieval_traces
                 ORDER BY created_at DESC
                 LIMIT ?1
@@ -3392,8 +3433,9 @@ impl Backend {
                     time_range,
                     candidate_count: row.get::<_, i64>(9)? as usize,
                     result_count: row.get::<_, i64>(10)? as usize,
-                    stage_json: row.get(11)?,
-                    created_at: row.get::<_, i64>(12)? as Timestamp,
+                    config_json: row.get(11)?,
+                    stage_json: row.get(12)?,
+                    created_at: row.get::<_, i64>(13)? as Timestamp,
                 })
             })
             .map_err(store_err)?;
@@ -4265,6 +4307,25 @@ mod tests {
     }
 
     #[test]
+    fn operations_for_memory_includes_edge_mentions() {
+        let db = Backend::open_in_memory(2).unwrap();
+        let a = MemoryId::new();
+        let b = MemoryId::new();
+        db.store_memory(&make_node(a, "alpha", vec![1.0, 0.0]))
+            .unwrap();
+        db.store_memory(&make_node(b, "beta", vec![0.0, 1.0]))
+            .unwrap();
+        db.add_edge(&edge(a, b, EdgeType::Related, 0.5)).unwrap();
+
+        let a_ops = db.operations_for_memory(a, 10).unwrap();
+        assert!(a_ops.iter().any(|op| op.operation_type == "memory_upsert"));
+        assert!(a_ops.iter().any(|op| op.operation_type == "edge_insert"));
+
+        let b_ops = db.operations_for_memory(b, 10).unwrap();
+        assert!(b_ops.iter().any(|op| op.operation_type == "edge_insert"));
+    }
+
+    #[test]
     fn memory_sources_roundtrip_with_store() {
         let db = Backend::open_in_memory(2).unwrap();
         let id = MemoryId::new();
@@ -4511,6 +4572,7 @@ mod tests {
         assert_eq!(traces.len(), 1);
         assert_eq!(traces[0].query_text.as_deref(), Some("postgres"));
         assert_eq!(traces[0].result_count, res.len());
+        assert!(traces[0].config_json.contains("rrf_weight"));
         assert!(traces[0].stage_json.contains("vector_candidates"));
 
         let hits = db.retrieval_trace_hits(&traces[0].trace_id).unwrap();
