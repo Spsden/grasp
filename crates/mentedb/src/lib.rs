@@ -44,6 +44,7 @@
 
 use std::path::{Path, PathBuf};
 
+use entity_extraction::{ExtractedEntity, RuleBasedEntityExtractor};
 use mentedb_cognitive::EntityResolver;
 use mentedb_cognitive::interference::{InterferenceDetector, InterferencePair};
 use mentedb_cognitive::llm::EntityMergeGroup;
@@ -99,6 +100,7 @@ pub use mentedb_sqlite::{
 };
 
 /// Renderer-neutral graph projection DTOs for app clients.
+pub mod entity_extraction;
 pub mod graph_projection;
 /// Unified process_turn orchestration.
 pub mod process_turn;
@@ -109,6 +111,7 @@ pub mod sleep;
 #[cfg(feature = "enrichment")]
 pub mod enrichment;
 
+pub use entity_extraction::{EntityExtractionConfig, ExtractedEntity as ExtractedMemoryEntity};
 pub use graph_projection::{
     GraphProjection, GraphProjectionConfig, GraphProjectionEdge, GraphProjectionNode,
 };
@@ -130,6 +133,9 @@ pub mod prelude {
     };
 
     pub use crate::MenteDb;
+    pub use crate::entity_extraction::{
+        EntityExtractionConfig, ExtractedEntity as ExtractedMemoryEntity,
+    };
 }
 
 use std::collections::HashMap;
@@ -253,6 +259,8 @@ pub struct CognitiveConfig {
     pub stream_config: StreamConfig,
     /// Configuration for sleeptime enrichment.
     pub enrichment_config: EnrichmentConfig,
+    /// Configuration for deterministic entity surface linking and entity-aware recall.
+    pub entity_extraction_config: EntityExtractionConfig,
     /// Similarity threshold for interference detection.
     pub interference_threshold: f32,
     /// Maximum trajectory turns to track.
@@ -279,6 +287,7 @@ impl Default for CognitiveConfig {
             archival_config: ArchivalConfig::default(),
             stream_config: StreamConfig::default(),
             enrichment_config: EnrichmentConfig::default(),
+            entity_extraction_config: EntityExtractionConfig::default(),
             interference_threshold: 0.8,
             trajectory_max_turns: 100,
             speculative_cache_size: 10,
@@ -516,6 +525,9 @@ impl MenteDb {
         // triggers keep the FTS5 mirror in sync automatically.
         self.db.store_memory(&node)?;
         self.graph.add_memory(id);
+        if let Err(e) = self.index_memory_entities(&node) {
+            warn!(memory_id = %id, error = %e, "failed to index memory entities");
+        }
 
         // Run write inference to auto-create edges and detect contradictions.
         if self.cognitive_config.write_inference {
@@ -544,6 +556,9 @@ impl MenteDb {
 
         self.db.store_memory_with_source(&node, &source)?;
         self.graph.add_memory(id);
+        if let Err(e) = self.index_memory_entities(&node) {
+            warn!(memory_id = %id, error = %e, "failed to index memory entities");
+        }
 
         if self.cognitive_config.write_inference {
             self.run_write_inference(&node);
@@ -582,10 +597,90 @@ impl MenteDb {
         let mut ids = Vec::with_capacity(nodes.len());
         for node in &nodes {
             self.graph.add_memory(node.id);
+            if let Err(e) = self.index_memory_entities(node) {
+                warn!(memory_id = %node.id, error = %e, "failed to index memory entities");
+            }
             ids.push(node.id);
         }
 
         Ok(ids)
+    }
+
+    fn index_memory_entities(&self, node: &MemoryNode) -> MenteResult<()> {
+        let config = self.cognitive_config.entity_extraction_config.clone();
+        if !config.enabled {
+            return Ok(());
+        }
+        let extractor = RuleBasedEntityExtractor::new(config);
+        let extracted = extractor.extract_memory(node);
+        self.persist_extracted_entities(node.id, &extracted)
+    }
+
+    fn persist_extracted_entities(
+        &self,
+        memory_id: MemoryId,
+        extracted: &[ExtractedEntity],
+    ) -> MenteResult<()> {
+        if extracted.is_empty() {
+            return self
+                .db
+                .replace_memory_entity_bundle(memory_id, &[], &[], &[]);
+        }
+
+        let mut records = Vec::with_capacity(extracted.len());
+        let mut aliases = Vec::new();
+        let mut links = Vec::with_capacity(extracted.len());
+        let now = current_time_us();
+
+        for mention in extracted {
+            let mut entity = match self
+                .db
+                .entity_by_canonical(&mention.entity_type, &mention.canonical)?
+            {
+                Some(mut existing) => {
+                    existing.confidence = existing.confidence.max(mention.confidence);
+                    existing.updated_at = now;
+                    existing
+                }
+                None => {
+                    let mut created =
+                        EntityRecord::new(mention.entity_type.clone(), mention.canonical.clone());
+                    created.confidence = mention.confidence;
+                    created
+                }
+            };
+            entity.attributes_json = "{}".to_string();
+            let entity_id = entity.entity_id.clone();
+
+            for alias in &mention.aliases {
+                aliases.push(EntityAlias {
+                    entity_id: entity_id.clone(),
+                    alias: alias.clone(),
+                    source: Some("surface_linker".to_string()),
+                    confidence: mention.confidence,
+                });
+            }
+
+            links.push(MemoryEntityLink {
+                memory_id,
+                entity_id,
+                role: mention
+                    .role
+                    .clone()
+                    .or_else(|| Some("mentioned".to_string())),
+                confidence: mention.confidence,
+                evidence: mention.evidence.clone(),
+            });
+            records.push(entity);
+        }
+
+        self.db
+            .replace_memory_entity_bundle(memory_id, &records, &aliases, &links)?;
+        let mut phantom = self.phantom.write();
+        for record in &records {
+            phantom.register_entity(&record.canonical);
+        }
+        Ok(())
     }
 
     /// Recalls memories using an MQL query string.
@@ -702,6 +797,15 @@ impl MenteDb {
             time_range,
             k * 3,
         )?;
+        let mut scored: HashMap<MemoryId, f32> = results.into_iter().collect();
+        for (id, boost) in self.entity_recall_candidates(query_text, tags, tags_or, time_range)? {
+            scored
+                .entry(id)
+                .and_modify(|score| *score += boost)
+                .or_insert(boost);
+        }
+        let mut results: Vec<(MemoryId, f32)> = scored.into_iter().collect();
+        results.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let graph = self.graph.graph();
         let filtered: Vec<(MemoryId, f32)> = results
             .into_iter()
@@ -723,6 +827,70 @@ impl MenteDb {
             .take(k)
             .collect();
         Ok(filtered)
+    }
+
+    fn entity_recall_candidates(
+        &self,
+        query_text: Option<&str>,
+        tags: Option<&[&str]>,
+        tags_or: bool,
+        time_range: Option<(Timestamp, Timestamp)>,
+    ) -> MenteResult<Vec<(MemoryId, f32)>> {
+        let Some(query) = query_text else {
+            return Ok(Vec::new());
+        };
+        let config = self.cognitive_config.entity_extraction_config.clone();
+        if !config.enabled || !config.recall_enabled || query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let extractor = RuleBasedEntityExtractor::new(config.clone());
+        let mentions = extractor.extract_query(query);
+        let mut lookup_aliases: HashMap<String, f32> = query_aliases(query, &config)
+            .into_iter()
+            .map(|alias| (alias, 1.0))
+            .collect();
+        for mention in mentions {
+            for alias in mention
+                .aliases
+                .iter()
+                .cloned()
+                .chain([mention.canonical.clone(), mention.canonical.to_lowercase()])
+            {
+                lookup_aliases
+                    .entry(alias)
+                    .and_modify(|confidence| *confidence = confidence.max(mention.confidence))
+                    .or_insert(mention.confidence);
+            }
+        }
+        if lookup_aliases.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut scored: HashMap<MemoryId, f32> = HashMap::new();
+        for (alias, alias_confidence) in lookup_aliases {
+            let entities = self.db.entities_by_alias(&alias)?;
+            for entity in entities {
+                let links = self.db.memories_for_entity(&entity.entity_id)?;
+                for link in links.into_iter().take(config.recall_fetch_limit) {
+                    let Some(memory) = self.db.get_memory(link.memory_id)? else {
+                        continue;
+                    };
+                    if !memory_matches_tags(&memory, tags, tags_or)
+                        || !memory_matches_time_range(&memory, time_range)
+                    {
+                        continue;
+                    }
+                    let boost = config.recall_boost * alias_confidence * link.confidence.max(0.0);
+                    scored
+                        .entry(link.memory_id)
+                        .and_modify(|score| *score = score.max(boost))
+                        .or_insert(boost);
+                }
+            }
+        }
+
+        Ok(scored.into_iter().collect())
     }
 
     /// Multi-query search with Reciprocal Rank Fusion (RRF).
@@ -2421,6 +2589,13 @@ impl MenteDb {
                         .unwrap_or_else(|_| updated.embedding.clone());
                 }
                 self.db.store_memory(&updated)?;
+                if let Err(e) = self.index_memory_entities(&updated) {
+                    warn!(
+                        memory_id = %updated.id,
+                        error = %e,
+                        "failed to index user profile entities"
+                    );
+                }
                 return Ok(updated.id);
             }
         }
@@ -2458,4 +2633,71 @@ impl MenteDb {
             .into_iter()
             .find(|m| m.tags.iter().any(|t| t == "user_profile"))
     }
+}
+
+fn current_time_us() -> Timestamp {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as Timestamp
+}
+
+fn memory_matches_tags(node: &MemoryNode, tags: Option<&[&str]>, tags_or: bool) -> bool {
+    let Some(tags) = tags else {
+        return true;
+    };
+    if tags.is_empty() {
+        return false;
+    }
+    if tags_or {
+        tags.iter()
+            .any(|tag| node.tags.iter().any(|memory_tag| memory_tag == tag))
+    } else {
+        tags.iter()
+            .all(|tag| node.tags.iter().any(|memory_tag| memory_tag == tag))
+    }
+}
+
+fn memory_matches_time_range(
+    node: &MemoryNode,
+    time_range: Option<(Timestamp, Timestamp)>,
+) -> bool {
+    match time_range {
+        Some((start, end)) => node.created_at >= start && node.created_at <= end,
+        None => true,
+    }
+}
+
+fn query_aliases(query: &str, config: &EntityExtractionConfig) -> Vec<String> {
+    let tokens: Vec<String> = query
+        .split_whitespace()
+        .map(|raw| {
+            raw.trim_matches(|ch: char| {
+                matches!(
+                    ch,
+                    ',' | ';' | ':' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | '?' | '!'
+                )
+            })
+            .trim_end_matches('.')
+            .to_lowercase()
+        })
+        .filter(|token| {
+            token.len() >= config.min_phrase_chars
+                && token.chars().any(|ch| ch.is_ascii_alphabetic())
+        })
+        .collect();
+
+    let mut aliases = Vec::new();
+    for start in 0..tokens.len() {
+        let max_end = (start + config.max_alias_words).min(tokens.len());
+        for end in (start + 1)..=max_end {
+            let alias = tokens[start..end].join(" ");
+            if alias.len() <= config.max_phrase_chars
+                && !aliases.iter().any(|existing| existing == &alias)
+            {
+                aliases.push(alias);
+            }
+        }
+    }
+    aliases
 }

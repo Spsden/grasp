@@ -40,6 +40,67 @@ fn test_store_and_recall_similar() {
 }
 
 #[test]
+fn test_store_indexes_entities_and_links() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = MenteDb::open(dir.path()).unwrap();
+
+    let node = make_memory(
+        "Name: Pratap.\nProject Synapse is a Flutter app with Google Workspace OAuth.",
+        vec![1.0, 0.0, 0.0, 0.0],
+    );
+    let id = node.id;
+    db.store(node).unwrap();
+
+    let pratap = db.entities_by_alias("pratap").unwrap();
+    assert_eq!(pratap.len(), 1);
+    assert_eq!(pratap[0].canonical, "Pratap");
+    assert_eq!(pratap[0].entity_type, "person");
+
+    let synapse = db.entities_by_alias("synapse").unwrap();
+    assert!(
+        synapse
+            .iter()
+            .any(|entity| entity.canonical == "Synapse" && entity.entity_type == "project")
+    );
+
+    let links = db.memory_entity_links(id).unwrap();
+    assert!(
+        links.len() >= 2,
+        "expected memory to be linked to extracted entities"
+    );
+
+    db.close().unwrap();
+}
+
+#[test]
+fn test_entity_recall_boosts_linked_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = MenteDb::open(dir.path()).unwrap();
+
+    let target = make_memory(
+        "Name: Pratap. Profession: Senior Full-Stack Engineer and Mobile Architect.",
+        vec![1.0, 0.0],
+    );
+    let target_id = target.id;
+    let distractor = make_memory("Unrelated deployment note", vec![0.0, 1.0]);
+
+    db.store(target).unwrap();
+    db.store(distractor).unwrap();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as u64;
+    let results = db
+        .recall_hybrid_at(&[0.0, 1.0], Some("who is pratap"), 1, now, None, None)
+        .unwrap();
+
+    assert_eq!(results.first().map(|(id, _)| *id), Some(target_id));
+
+    db.close().unwrap();
+}
+
+#[test]
 fn test_forget_memory() {
     let dir = tempfile::tempdir().unwrap();
     let db = MenteDb::open(dir.path()).unwrap();

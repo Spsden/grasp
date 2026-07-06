@@ -488,6 +488,24 @@ impl Backend {
     /// the embeddings already stored in `memories.embedding`. Called by the
     /// facade once an embedder is configured. No-op if the index already exists
     /// at the same dimension.
+    ///
+    /// Detailed behavior:
+    /// - Early exit if `dim == 0` (deferred, no index) or if `dim` equals the
+    ///   current in-memory `embedding_dim`.
+    /// - Executes inside a DB transaction: drops any existing `memory_vec` and
+    ///   recreates it with `CREATE VIRTUAL TABLE memory_vec USING
+    ///   vec0(embedding float[<dim>])` so vec0 is configured for the requested
+    ///   dimensionality.
+    /// - Backfills by scanning `memories` for non-null `embedding` blobs:
+    ///   - rows with a stored vector length != `dim` are skipped;
+    ///   - matching vectors are normalized (so cosine similarity becomes
+    ///     equivalent to L2 on the stored vectors), converted to a BLOB, and
+    ///     inserted into `memory_vec` as `(rowid, embedding)`.
+    /// - Updates `schema_meta.embedding_dim`, records a `vector_index_rebuild`
+    ///   operation with counts (`backfilled`, `skipped_dimension_mismatch`),
+    ///   commits the transaction, and updates the in-memory `embedding_dim`.
+    /// - Note: the original embeddings remain in `memories.embedding`; only a
+    ///   normalized copy is stored in `memory_vec` for KNN.
     pub fn ensure_vector_index(&self, dim: usize) -> Result<(), MenteError> {
         if dim == 0 || dim == self.embedding_dim.load(Ordering::Relaxed) {
             return Ok(());
@@ -1255,6 +1273,43 @@ impl Backend {
         .map_err(store_err)
     }
 
+    /// Resolve an entity by exact `(entity_type, canonical)` identity.
+    ///
+    /// The facade normalizes canonical names before writing. Keeping lookup
+    /// here avoids duplicate canonical entities while preserving aliases as
+    /// separate lookup rows.
+    pub fn entity_by_canonical(
+        &self,
+        entity_type: &str,
+        canonical: &str,
+    ) -> Result<Option<EntityRecord>, MenteError> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            r#"
+            SELECT entity_id, entity_type, canonical, attributes_json,
+                   confidence, created_at, updated_at
+            FROM entities
+            WHERE entity_type = ?1 AND canonical = ?2
+            ORDER BY updated_at DESC
+            LIMIT 1
+            "#,
+            params![entity_type, canonical],
+            |row| {
+                Ok(EntityRecord {
+                    entity_id: row.get(0)?,
+                    entity_type: row.get(1)?,
+                    canonical: row.get(2)?,
+                    attributes_json: row.get(3)?,
+                    confidence: row.get::<_, f64>(4)? as f32,
+                    created_at: row.get::<_, i64>(5)? as Timestamp,
+                    updated_at: row.get::<_, i64>(6)? as Timestamp,
+                })
+            },
+        )
+        .optional()
+        .map_err(store_err)
+    }
+
     /// List canonical entities, sorted by update time.
     pub fn list_entities(&self, limit: usize) -> Result<Vec<EntityRecord>, MenteError> {
         let conn = self.conn.lock();
@@ -1367,6 +1422,68 @@ impl Backend {
         let mut conn = self.conn.lock();
         let tx = conn.transaction().map_err(store_err)?;
         Self::link_memory_entity_on(&tx, link)?;
+        tx.commit().map_err(store_err)
+    }
+
+    /// Batch upsert canonical entities, aliases, and links for one or more
+    /// memories in a single transaction.
+    pub fn upsert_entity_bundle(
+        &self,
+        entities: &[EntityRecord],
+        aliases: &[EntityAlias],
+        links: &[MemoryEntityLink],
+    ) -> Result<(), MenteError> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(store_err)?;
+        for entity in entities {
+            Self::upsert_entity_on(&tx, entity)?;
+        }
+        for alias in aliases {
+            Self::add_entity_alias_on(&tx, alias)?;
+        }
+        for link in links {
+            Self::link_memory_entity_on(&tx, link)?;
+        }
+        tx.commit().map_err(store_err)
+    }
+
+    /// Replace all entity links for a memory, then upsert canonical entities
+    /// and aliases used by the new links.
+    pub fn replace_memory_entity_bundle(
+        &self,
+        memory_id: MemoryId,
+        entities: &[EntityRecord],
+        aliases: &[EntityAlias],
+        links: &[MemoryEntityLink],
+    ) -> Result<(), MenteError> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(store_err)?;
+        tx.execute(
+            "DELETE FROM memory_entities WHERE memory_id = ?1",
+            params![memory_id.to_string()],
+        )
+        .map_err(store_err)?;
+        for entity in entities {
+            Self::upsert_entity_on(&tx, entity)?;
+        }
+        for alias in aliases {
+            Self::add_entity_alias_on(&tx, alias)?;
+        }
+        for link in links {
+            Self::link_memory_entity_on(&tx, link)?;
+        }
+        Self::record_operation_on(
+            &tx,
+            "memory_entity_links_replace",
+            Some(memory_id),
+            None,
+            None,
+            serde_json::json!({
+                "entity_count": entities.len(),
+                "alias_count": aliases.len(),
+                "link_count": links.len(),
+            }),
+        )?;
         tx.commit().map_err(store_err)
     }
 

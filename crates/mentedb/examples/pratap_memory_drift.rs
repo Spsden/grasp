@@ -37,6 +37,7 @@ struct Args {
     embedding_provider: String,
     embedding_api_key_env: String,
     embedding_model: Option<String>,
+    trace_retrieval: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -85,6 +86,8 @@ struct TurnRecord {
     post_facts_extracted: usize,
     post_edges_created: u32,
     post_enrichment_pending: bool,
+    pre_trace_id: Option<String>,
+    post_trace_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -114,6 +117,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut db = MenteDb::open(&args.db_dir)?;
     set_embedding_provider(&mut db, &args)?;
+    db.set_retrieval_tracing(args.trace_retrieval);
     let mut delta_tracker = DeltaTracker::new();
 
     let seeded_ids = seed_memory_bank(&db, &fixture)?;
@@ -139,6 +143,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "db_dir": args.db_dir,
             "turn_mode": format_turn_mode(args.turn_mode),
             "seeded_memory_ids": seeded_ids,
+            "trace_retrieval": args.trace_retrieval,
             "llm_enabled": false,
             "runner": "rust"
         }),
@@ -147,6 +152,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut records = Vec::new();
     for (idx, turn) in fixture.turns.iter().enumerate() {
         let turn_index = idx + 1;
+        let pre_previous_trace = latest_trace_id(&db)?;
         let pre_result = match args.turn_mode {
             TurnMode::MimicFlutter => process_turn(
                 &db,
@@ -158,11 +164,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?,
             TurnMode::SingleProcess => search_context(&db, &turn.question, 8)?,
         };
+        let pre_trace_id = latest_trace_id_if_changed(&db, pre_previous_trace.as_deref())?;
 
         let retrieved_context = context_text(&pre_result.context);
         let coverage = compute_coverage(&retrieved_context, &turn.required_context_terms);
         let answer = synthetic_answer(&turn.id);
 
+        let post_previous_trace = latest_trace_id(&db)?;
         let post_result = process_turn(
             &db,
             &mut delta_tracker,
@@ -171,6 +179,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             turn_index as u64,
             &fixture.project_context,
         )?;
+        let post_trace_id = latest_trace_id_if_changed(&db, post_previous_trace.as_deref())?;
 
         let record = TurnRecord {
             kind: "turn",
@@ -204,6 +213,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             post_facts_extracted: post_result.facts_extracted,
             post_edges_created: post_result.edges_created,
             post_enrichment_pending: post_result.enrichment_pending,
+            pre_trace_id,
+            post_trace_id,
         };
 
         print_turn_summary(&record);
@@ -260,6 +271,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         embedding_model: env::var("MENTEDB_EMBEDDING_MODEL")
             .ok()
             .filter(|value| !value.is_empty()),
+        trace_retrieval: false,
     };
 
     while let Some(flag) = values.next() {
@@ -268,6 +280,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
             "--db-dir" => args.db_dir = PathBuf::from(next_value(&mut values, "--db-dir")?),
             "--output" => args.output = Some(PathBuf::from(next_value(&mut values, "--output")?)),
             "--dry-run" => args.dry_run = true,
+            "--trace-retrieval" => args.trace_retrieval = true,
             "--turn-mode" => {
                 args.turn_mode = match next_value(&mut values, "--turn-mode")?.as_str() {
                     "mimic-flutter" => TurnMode::MimicFlutter,
@@ -318,6 +331,7 @@ fn print_help() {
     println!("  --embedding-provider <hash|ollama|openai|cohere|voyage>");
     println!("  --embedding-model <model>");
     println!("  --embedding-api-key-env <name>   Defaults to OPENAI_API_KEY");
+    println!("  --trace-retrieval                Persist retrieval traces and emit trace ids");
     println!("  --dry-run");
 }
 
@@ -511,6 +525,22 @@ fn search_context(db: &MenteDb, query: &str, limit: usize) -> MenteResult<Proces
     })
 }
 
+fn latest_trace_id(db: &MenteDb) -> MenteResult<Option<String>> {
+    Ok(db
+        .recent_retrieval_traces(1)?
+        .into_iter()
+        .next()
+        .map(|trace| trace.trace_id))
+}
+
+fn latest_trace_id_if_changed(db: &MenteDb, previous: Option<&str>) -> MenteResult<Option<String>> {
+    let latest = latest_trace_id(db)?;
+    Ok(match (latest, previous) {
+        (Some(latest), Some(previous)) if latest == previous => None,
+        (latest, _) => latest,
+    })
+}
+
 fn context_text(context: &[ScoredMemory]) -> String {
     let mut lines = Vec::new();
     for (idx, item) in context.iter().enumerate() {
@@ -579,6 +609,12 @@ fn print_turn_summary(record: &TurnRecord) {
     );
     if !record.missing_context_terms.is_empty() {
         println!("    missing: {}", record.missing_context_terms.join(", "));
+    }
+    if let Some(trace_id) = &record.pre_trace_id {
+        println!("    pre_trace: {trace_id}");
+    }
+    if let Some(trace_id) = &record.post_trace_id {
+        println!("    post_trace: {trace_id}");
     }
     for snippet in record.context_snippets.iter().take(2) {
         println!("    context: {snippet}");
