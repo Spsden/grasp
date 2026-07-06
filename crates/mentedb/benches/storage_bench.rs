@@ -1,10 +1,9 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use mentedb::context::{AssemblyConfig, ContextAssembler, ScoredMemory};
 use mentedb::core::memory::{MemoryNode, MemoryType};
-use mentedb::index::hnsw::{HnswConfig, HnswIndex};
 use mentedb::query::mql::Mql;
 use mentedb::sqlite::Backend;
-use mentedb_core::types::{AgentId, MemoryId};
+use mentedb_core::types::AgentId;
 
 fn random_embedding(dim: usize) -> Vec<f32> {
     // Simple pseudo-random via system time mixed with counter.
@@ -53,26 +52,29 @@ fn bench_storage_write(c: &mut Criterion) {
             },
             |(_dir, engine, memories)| {
                 for mem in &memories {
-                    black_box(engine.store_memory(mem).unwrap());
+                    let _: () = engine.store_memory(mem).unwrap();
+                    black_box(());
                 }
             },
         );
     });
 }
 
-fn bench_hnsw_search(c: &mut Criterion) {
-    // Build the index once outside the benchmark loop.
-    let index = HnswIndex::new(HnswConfig::default());
+fn bench_knn_search(c: &mut Criterion) {
+    // Populate a SQLite backend once, outside the benchmark loop. This replaces
+    // the former in-memory HNSW benchmark now that vector search runs through
+    // the sqlite-vec / Backend KNN path.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("bench.sqlite");
+    let engine = Backend::open(&db_path, 128).unwrap();
     for _ in 0..10_000 {
-        index
-            .insert(MemoryId::new(), &random_embedding(128))
-            .unwrap();
+        engine.store_memory(&make_memory(0)).unwrap();
     }
 
-    c.bench_function("hnsw_search_top10", |b| {
+    c.bench_function("knn_search_top10", |b| {
         b.iter(|| {
             let query = random_embedding(128);
-            black_box(index.search(&query, 10));
+            black_box(engine.knn(&query, 10).unwrap());
         });
     });
 }
@@ -129,7 +131,7 @@ fn bench_mql_parse(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_storage_write,
-    bench_hnsw_search,
+    bench_knn_search,
     bench_context_assembly,
     bench_mql_parse,
 );

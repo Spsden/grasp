@@ -3,6 +3,11 @@
 //!
 //! Run with: cargo run --example cognitive_features
 
+// Several demonstrations below are intentionally dormant while the heuristics
+// are revised (see the TODO in `main`). They are kept as reference so they can
+// be re-enabled once improved.
+#![allow(dead_code)]
+
 use mentedb_cognitive::{
     CognitionStream, PainRegistry, PainSignal, PhantomConfig, PhantomTracker, StreamAlert,
     TrajectoryNode, TrajectoryTracker, trajectory::DecisionState,
@@ -36,7 +41,7 @@ fn demonstrate_stream_cognition() {
     let stream = CognitionStream::new(256);
 
     // Simulate an LLM generating tokens.
-    let tokens = [
+    let _tokens = [
         "The", " user", " prefers", " light", " mode", " in", " editors",
     ];
     // for token in &tokens {
@@ -162,10 +167,8 @@ fn demonstrate_phantom_detection() {
     println!("Detected {} phantom memories:", phantoms.len());
     for phantom in &phantoms {
         println!(
-            "  [{}] gap: '{}', source: '{}'",
-            format!("{:?}", phantom.priority),
-            phantom.gap_description,
-            phantom.source_reference
+            "  [{:?}] gap: '{}', source: '{}'",
+            phantom.priority, phantom.gap_description, phantom.source_reference
         );
     }
 
@@ -278,15 +281,13 @@ fn demonstrate_stream_cognition_sps() {
     let alerts = stream.check_alerts(&known_facts);
 
     for alert in alerts {
-        match alert {
-            StreamAlert::Contradiction {
-                ai_said, stored, ..
-            } => {
-                println!("Contradiction detected!");
-                println!("AI said: {}", ai_said);
-                println!("Stored fact: {}", stored);
-            }
-            _ => {}
+        if let StreamAlert::Contradiction {
+            ai_said, stored, ..
+        } = alert
+        {
+            println!("Contradiction detected!");
+            println!("AI said: {}", ai_said);
+            println!("Stored fact: {}", stored);
         }
     }
 

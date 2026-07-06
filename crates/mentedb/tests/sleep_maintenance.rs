@@ -4,8 +4,10 @@ use mentedb_core::types::AgentId;
 
 fn open_sleep_test_db() -> (MenteDb, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let mut config = CognitiveConfig::default();
-    config.write_inference = false;
+    let config = CognitiveConfig {
+        write_inference: false,
+        ..Default::default()
+    };
     let db = MenteDb::open_with_config(dir.path(), config).unwrap();
     (db, dir)
 }

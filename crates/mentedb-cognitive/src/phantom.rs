@@ -495,8 +495,10 @@ mod tests {
 
     #[test]
     fn test_heuristic_disabled() {
-        let mut config = PhantomConfig::default();
-        config.use_heuristic_detection = false;
+        let config = PhantomConfig {
+            use_heuristic_detection: false,
+            ..Default::default()
+        };
         let mut tracker = PhantomTracker::new(config);
 
         // No entities registered and heuristic off — should find nothing.
@@ -510,8 +512,10 @@ mod tests {
 
     #[test]
     fn test_heuristic_disabled_with_registry() {
-        let mut config = PhantomConfig::default();
-        config.use_heuristic_detection = false;
+        let config = PhantomConfig {
+            use_heuristic_detection: false,
+            ..Default::default()
+        };
         let mut tracker = PhantomTracker::new(config);
         tracker.register_entity("Kubernetes");
 

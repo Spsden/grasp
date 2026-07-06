@@ -159,7 +159,7 @@ mod tests {
         // ids[0] and ids[1] should not be adjacent
         for w in arranged.windows(2) {
             assert!(
-                !(w[0] == ids[0] && w[1] == ids[1]) && !(w[0] == ids[1] && w[1] == ids[0]),
+                !(w[0] == ids[0] && w[1] == ids[1] || w[0] == ids[1] && w[1] == ids[0]),
                 "Interference pair should not be adjacent"
             );
         }

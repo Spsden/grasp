@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::str::FromStr;
 
@@ -200,7 +200,7 @@ fn print_usage() {
     );
 }
 
-fn print_summary(db: &MenteDb, db_dir: &PathBuf, limit: usize) -> MenteResult<()> {
+fn print_summary(db: &MenteDb, db_dir: &Path, limit: usize) -> MenteResult<()> {
     let entities = db.list_entities(limit)?;
     let traces = db.recent_retrieval_traces(limit)?;
     let operations = db.recent_memory_operations(limit)?;
@@ -419,15 +419,9 @@ fn print_operation_with_prefix(prefix: &str, op: &MemoryOperation) {
         prefix,
         op.operation_id,
         op.operation_type,
-        op.memory_id
-            .map(|id| id.to_string())
-            .unwrap_or_else(|| "".to_string()),
-        op.source
-            .map(|id| id.to_string())
-            .unwrap_or_else(|| "".to_string()),
-        op.target
-            .map(|id| id.to_string())
-            .unwrap_or_else(|| "".to_string()),
+        op.memory_id.map(|id| id.to_string()).unwrap_or_default(),
+        op.source.map(|id| id.to_string()).unwrap_or_default(),
+        op.target.map(|id| id.to_string()).unwrap_or_default(),
         op.created_at,
         compact(&op.payload_json, 180)
     );
@@ -512,19 +506,13 @@ fn compact(text: &str, max_chars: usize) -> String {
 }
 
 fn optional_ts(value: Option<u64>) -> String {
-    value
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "".to_string())
+    value.map(|value| value.to_string()).unwrap_or_default()
 }
 
 fn optional_usize(value: Option<usize>) -> String {
-    value
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "".to_string())
+    value.map(|value| value.to_string()).unwrap_or_default()
 }
 
 fn optional_f32(value: Option<f32>) -> String {
-    value
-        .map(|value| format!("{value:.3}"))
-        .unwrap_or_else(|| "".to_string())
+    value.map(|value| format!("{value:.3}")).unwrap_or_default()
 }

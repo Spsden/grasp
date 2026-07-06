@@ -14,9 +14,7 @@ categories = ["database-implementations", "algorithms"]
 mentedb-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tracing = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
 ureq = { version = "3", features = ["json"], optional = true }
 candle-core = { version = "0.10", optional = true }
 candle-nn = { version = "0.10", optional = true }
@@ -31,8 +29,6 @@ local = ["candle-core", "candle-nn", "candle-transformers", "tokenizers", "hf-hu
 
 [dev-dependencies]
 uuid = { workspace = true }
-tempfile = { workspace = true }
-tokio = { workspace = true, features = ["full", "test-util"] }
 
 [package.metadata.docs.rs]
 all-features = true

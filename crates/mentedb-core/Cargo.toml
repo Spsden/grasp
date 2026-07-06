@@ -15,10 +15,7 @@ uuid = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-bytes = { workspace = true }
-bytemuck = { workspace = true }
 smallvec = { workspace = true }
-ahash = { workspace = true }
 parking_lot = { workspace = true }
 
 [package.metadata.docs.rs]
