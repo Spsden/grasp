@@ -86,6 +86,7 @@ pub struct RetrievalTrace {
     pub time_range: Option<(Timestamp, Timestamp)>,
     pub candidate_count: usize,
     pub result_count: usize,
+    pub stage_json: String,
     pub created_at: Timestamp,
 }
 
@@ -96,9 +97,11 @@ pub struct RetrievalTraceHit {
     pub rank: usize,
     pub memory_id: MemoryId,
     pub score: f32,
+    pub source: String,
     pub vector_rank: Option<usize>,
     pub bm25_rank: Option<usize>,
     pub salience: Option<f32>,
+    pub explanation_json: String,
 }
 
 /// A write-side audit record.
@@ -1156,6 +1159,7 @@ impl Backend {
                 candidate_count     INTEGER NOT NULL,
                 result_count        INTEGER NOT NULL,
                 config_json         TEXT NOT NULL,
+                stage_json          TEXT NOT NULL DEFAULT '{}',
                 created_at          INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_retrieval_traces_created
@@ -1166,9 +1170,11 @@ impl Backend {
                 rank        INTEGER NOT NULL,
                 memory_id   TEXT NOT NULL,
                 score       REAL NOT NULL,
+                source      TEXT NOT NULL DEFAULT 'hybrid',
                 vector_rank INTEGER,
                 bm25_rank   INTEGER,
                 salience    REAL,
+                explanation_json TEXT NOT NULL DEFAULT '{}',
                 PRIMARY KEY(trace_id, rank),
                 FOREIGN KEY(trace_id) REFERENCES retrieval_traces(trace_id) ON DELETE CASCADE
             );
@@ -3360,7 +3366,7 @@ impl Backend {
                 r#"
                 SELECT trace_id, query_text, query_embedding_dim, k, fetch_k,
                        tags_json, tags_or, time_start, time_end,
-                       candidate_count, result_count, created_at
+                       candidate_count, result_count, stage_json, created_at
                 FROM retrieval_traces
                 ORDER BY created_at DESC
                 LIMIT ?1
@@ -3386,7 +3392,8 @@ impl Backend {
                     time_range,
                     candidate_count: row.get::<_, i64>(9)? as usize,
                     result_count: row.get::<_, i64>(10)? as usize,
-                    created_at: row.get::<_, i64>(11)? as Timestamp,
+                    stage_json: row.get(11)?,
+                    created_at: row.get::<_, i64>(12)? as Timestamp,
                 })
             })
             .map_err(store_err)?;
@@ -3406,7 +3413,8 @@ impl Backend {
         let mut stmt = conn
             .prepare(
                 r#"
-                SELECT trace_id, rank, memory_id, score, vector_rank, bm25_rank, salience
+                SELECT trace_id, rank, memory_id, score, source, vector_rank,
+                       bm25_rank, salience, explanation_json
                 FROM retrieval_trace_hits
                 WHERE trace_id = ?1
                 ORDER BY rank ASC
@@ -3422,9 +3430,11 @@ impl Backend {
                     rank: row.get::<_, i64>(1)? as usize,
                     memory_id,
                     score: row.get::<_, f64>(3)? as f32,
-                    vector_rank: row.get::<_, Option<i64>>(4)?.map(|rank| rank as usize),
-                    bm25_rank: row.get::<_, Option<i64>>(5)?.map(|rank| rank as usize),
-                    salience: row.get::<_, Option<f64>>(6)?.map(|score| score as f32),
+                    source: row.get(4)?,
+                    vector_rank: row.get::<_, Option<i64>>(5)?.map(|rank| rank as usize),
+                    bm25_rank: row.get::<_, Option<i64>>(6)?.map(|rank| rank as usize),
+                    salience: row.get::<_, Option<f64>>(7)?.map(|score| score as f32),
+                    explanation_json: row.get(8)?,
                 })
             })
             .map_err(store_err)?;
@@ -3465,6 +3475,15 @@ impl Backend {
             .enumerate()
             .map(|(rank, id)| (*id, rank + 1))
             .collect();
+        let stage_json = serde_json::to_string(&json!({
+            "vector_candidates": vector_hits.len(),
+            "keyword_candidates": bm25_hits.len(),
+            "fused_candidates": candidate_count,
+            "final_results": scored.len(),
+            "requested_k": k,
+            "fetch_k": fetch_k,
+        }))
+        .map_err(store_err)?;
 
         let mut conn = self.conn.lock();
         let tx = conn.transaction().map_err(store_err)?;
@@ -3473,8 +3492,8 @@ impl Backend {
             INSERT INTO retrieval_traces (
                 trace_id, query_text, query_embedding_dim, k, fetch_k,
                 tags_json, tags_or, time_start, time_end, candidate_count,
-                result_count, config_json, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                result_count, config_json, stage_json, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
             "#,
             params![
                 trace_id,
@@ -3489,6 +3508,7 @@ impl Backend {
                 usize_to_i64(candidate_count)?,
                 usize_to_i64(scored.len())?,
                 config_json,
+                stage_json,
                 created_at as i64,
             ],
         )
@@ -3503,20 +3523,52 @@ impl Backend {
                 )
                 .optional()
                 .map_err(store_err)?;
+            let vector_rank = vector_ranks.get(id).copied();
+            let bm25_rank = bm25_ranks.get(id).copied();
+            let source = match (vector_rank, bm25_rank) {
+                (Some(_), Some(_)) => "hybrid",
+                (Some(_), None) => "vector",
+                (None, Some(_)) => "keyword",
+                (None, None) => "rerank",
+            };
+            let mut signals = Vec::new();
+            if vector_rank.is_some() {
+                signals.push("vector");
+            }
+            if bm25_rank.is_some() {
+                signals.push("keyword");
+            }
+            let explanation_json = serde_json::to_string(&json!({
+                "signals": signals,
+                "vector_rank": vector_rank,
+                "keyword_rank": bm25_rank,
+                "salience": salience,
+                "score": score,
+                "score_terms": {
+                    "rrf_weight": config.rrf_weight,
+                    "salience_weight": config.salience_weight,
+                    "recency_weight": config.recency_weight,
+                    "recency_prior": config.recency_prior,
+                },
+            }))
+            .map_err(store_err)?;
             tx.execute(
                 r#"
                 INSERT INTO retrieval_trace_hits (
-                    trace_id, rank, memory_id, score, vector_rank, bm25_rank, salience
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                    trace_id, rank, memory_id, score, source, vector_rank,
+                    bm25_rank, salience, explanation_json
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                 "#,
                 params![
                     trace_id,
                     usize_to_i64(rank + 1)?,
                     id.to_string(),
                     *score as f64,
-                    vector_ranks.get(id).map(|rank| *rank as i64),
-                    bm25_ranks.get(id).map(|rank| *rank as i64),
+                    source,
+                    vector_rank.map(|rank| rank as i64),
+                    bm25_rank.map(|rank| rank as i64),
                     salience,
+                    explanation_json,
                 ],
             )
             .map_err(store_err)?;
@@ -4459,10 +4511,19 @@ mod tests {
         assert_eq!(traces.len(), 1);
         assert_eq!(traces[0].query_text.as_deref(), Some("postgres"));
         assert_eq!(traces[0].result_count, res.len());
+        assert!(traces[0].stage_json.contains("vector_candidates"));
 
         let hits = db.retrieval_trace_hits(&traces[0].trace_id).unwrap();
         assert_eq!(hits.len(), res.len());
         assert!(hits.iter().any(|hit| hit.bm25_rank.is_some()));
+        assert!(
+            hits.iter()
+                .any(|hit| hit.source == "keyword" || hit.source == "hybrid")
+        );
+        assert!(
+            hits.iter()
+                .all(|hit| hit.explanation_json.contains("signals"))
+        );
     }
 
     #[test]

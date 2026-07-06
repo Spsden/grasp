@@ -494,6 +494,7 @@ CREATE TABLE retrieval_traces (
     candidate_count     INTEGER NOT NULL,
     result_count        INTEGER NOT NULL,
     config_json         TEXT NOT NULL,
+    stage_json          TEXT NOT NULL DEFAULT '{}',
     created_at          INTEGER NOT NULL
 );
 
@@ -512,6 +513,10 @@ CREATE INDEX idx_retrieval_traces_created
 - `multi_query_rrf_k`
 - `trace_retention_limit`
 
+`stage_json` captures pipeline counts for the run, including vector candidate
+count, keyword candidate count, fused candidate count, final result count,
+requested `k`, and internal `fetch_k`.
+
 ### `retrieval_trace_hits`
 
 Final ranked hit details for a retrieval trace.
@@ -522,9 +527,11 @@ CREATE TABLE retrieval_trace_hits (
     rank        INTEGER NOT NULL,
     memory_id   TEXT NOT NULL,
     score       REAL NOT NULL,
+    source      TEXT NOT NULL DEFAULT 'hybrid',
     vector_rank INTEGER,
     bm25_rank   INTEGER,
     salience    REAL,
+    explanation_json TEXT NOT NULL DEFAULT '{}',
     PRIMARY KEY(trace_id, rank),
     FOREIGN KEY(trace_id) REFERENCES retrieval_traces(trace_id) ON DELETE CASCADE
 );
@@ -534,6 +541,8 @@ CREATE INDEX idx_retrieval_trace_hits_memory
 ```
 
 This table answers the practical question, "Why did this result appear here?"
+`source` is one of `vector`, `keyword`, `hybrid`, or `rerank`.
+`explanation_json` stores the contributing signals and score terms for the hit.
 
 ## Runtime Flow
 
@@ -582,7 +591,7 @@ Latest retrieval traces:
 
 ```sql
 SELECT trace_id, query_text, k, fetch_k, candidate_count, result_count,
-       config_json, created_at
+       stage_json, config_json, created_at
 FROM retrieval_traces
 ORDER BY created_at DESC
 LIMIT 20;
@@ -591,7 +600,8 @@ LIMIT 20;
 Why a trace ranked its final results:
 
 ```sql
-SELECT h.rank, h.memory_id, h.score, h.vector_rank, h.bm25_rank, h.salience,
+SELECT h.rank, h.memory_id, h.score, h.source, h.vector_rank, h.bm25_rank,
+       h.salience, h.explanation_json,
        m.content, m.memory_type, m.confidence, m.valid_from, m.valid_until
 FROM retrieval_trace_hits h
 JOIN memories m ON m.id = h.memory_id
