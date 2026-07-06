@@ -23,8 +23,8 @@ version = "0.9.2"
 edition = "2024"
 authors = ["Nam Rodriguez <nambok@gmail.com>"]
 license = "Apache-2.0"
-repository = "https://github.com/nambok/mentedb"
-description = "A purpose-built database engine for AI agent memory"
+repository = "https://github.com/Spsden/grasp"
+description = "A SQLite-backed AI memory layer for agents"
 
 [workspace.dependencies]
 # Core

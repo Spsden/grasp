@@ -22,3 +22,13 @@ cargo_errors.txt
 .venv/
 __pycache__/
 *.dSYM/
+
+# Generated benchmark and local database artifacts
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+benchmarks/results/*.jsonl
+benchmarks/test-db*/
+benchmarks/test_db*/
+benchmarks/**/test-db*/

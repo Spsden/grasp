@@ -1,0 +1,12 @@
+Grasp
+
+This product is derived from the original MenteDB project by Nam Rodriguez.
+
+Original project metadata:
+- Author: Nam Rodriguez <nambok@gmail.com>
+- Repository: https://github.com/nambok/mentedb
+- License: Apache-2.0
+
+The SQLite-backed storage direction, Synapse-oriented memory debugging goals,
+entity-linked recall work, and future extraction roadmap are derivative work in
+Grasp.
