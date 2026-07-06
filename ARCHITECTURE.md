@@ -2,24 +2,30 @@
 
 ## Overview
 
-MenteDB is a cognition aware database engine for AI agent memory, built from scratch
+Grasp (formerly MenteDB) is a cognition aware memory engine for AI agents, written
 in Rust. Rather than treating memory as a retrieval problem (store text, search later),
-MenteDB pre digests knowledge for single pass transformer consumption. Every write
+it pre digests knowledge for single pass transformer consumption. Every write
 triggers inference. Every read is shaped by attention budgets. The engine thinks about
 what it stores so the LLM doesn't have to.
 
-The system is organized as a Cargo workspace of 13 crates, each owning a distinct
+The durable store is SQLite. Canonical memory rows live in SQLite tables, and
+`sqlite-vec` and FTS5 are rebuildable projections over those rows. The original
+MenteDB custom page store, WAL, hand written HNSW index, and CSR/CSC persistence
+have been retired in favor of inspectable, durable SQL rows (see
+[docs/SQLITE_MEMORY_SCHEMA.md](docs/SQLITE_MEMORY_SCHEMA.md)). The Rust crate and
+facade names are still `mentedb*` / `MenteDb` until the rename is completed.
+
+The system is organized as a Cargo workspace of 11 crates, each owning a distinct
 responsibility. The facade crate (`mentedb`) wires them together behind a small,
 coherent API: `open`, `store`, `recall`, `relate`, `forget`, `close`.
 
 ## Crate Map
 
 ```
-mentedb (workspace root)
+grasp (workspace root)
  |
  +-- mentedb-core            Fundamental types shared by every crate
- +-- mentedb-storage          Page manager, WAL, buffer pool
- +-- mentedb-index            HNSW vectors, bitmap tags, temporal, salience
+ +-- mentedb-sqlite           SQLite durable store: vec0 vectors, FTS5, graph rows, provenance, retrieval traces
  +-- mentedb-graph            CSR/CSC knowledge graph, traversal, belief propagation
  +-- mentedb-query            MQL lexer, parser, query planner
  +-- mentedb-context          Token budgets, U curve attention, delta serving, serializers
@@ -27,8 +33,7 @@ mentedb (workspace root)
  +-- mentedb-consolidation    Decay, compression, fact extraction, archival, GDPR forget
  +-- mentedb-extraction       LLM-powered entity/relation extraction pipeline
  +-- mentedb-embedding        Embedding provider abstraction (OpenAI, local)
- +-- mentedb-replication      Multi-node replication protocol
- +-- mentedb-server           HTTP/TCP server wrapping the facade
+ +-- mentedb-server           HTTP/gRPC server wrapping the facade
  +-- mentedb                  Unified facade re-exporting the subsystems
 ```
 
@@ -41,21 +46,19 @@ mentedb-server
 mentedb  (facade)
     |
     +-----> mentedb-core
-    +-----> mentedb-storage -----> mentedb-core
-    +-----> mentedb-index -------> mentedb-core
-    +-----> mentedb-graph -------> mentedb-core
-    +-----> mentedb-query -------> mentedb-core
-    +-----> mentedb-context -----> mentedb-core
+    +-----> mentedb-sqlite -------> mentedb-core
+    +-----> mentedb-graph --------> mentedb-core
+    +-----> mentedb-query --------> mentedb-core
+    +-----> mentedb-context ------> mentedb-core
     
 mentedb-cognitive ------------> mentedb-core
 mentedb-consolidation --------> mentedb-core
 mentedb-extraction -----------> mentedb-core
 mentedb-embedding ------------> mentedb-core
-mentedb-replication ----------> mentedb-core
 ```
 
 All subsystem crates depend only on `mentedb-core`. The facade crate pulls in
-storage, index, graph, query, and context. The cognitive and consolidation crates
+sqlite, graph, query, and context. The cognitive and consolidation crates
 are deliberately decoupled, they share types through core but can be compiled and
 tested independently.
 
@@ -97,91 +100,53 @@ pub type Salience   = f32;       // 0.0 .. 1.0
 pub type Confidence = f32;       // 0.0 .. 1.0
 ```
 
-### mentedb-storage
+### mentedb-sqlite
 
-Owns all durable state. Implements a page oriented storage engine with
-write ahead logging and a buffer pool.
+Owns all durable state. SQLite is the source of truth: canonical memory rows live
+in plain SQL tables, and `sqlite-vec` and FTS5 are rebuildable projections over
+those rows. The full schema is documented in
+[docs/SQLITE_MEMORY_SCHEMA.md](docs/SQLITE_MEMORY_SCHEMA.md).
 
-**Page Manager** (`page.rs`):
-Pages are 16 KB, the same size PostgreSQL uses. Each page carries a header
-with its ID, LSN (log sequence number), checksum, free space counter, slot count,
-and page type (Free, Data, Index, Overflow). The page manager maps a directory
-to a single data file, maintains a free list for page allocation, and provides
-`allocate_page`, `read_page`, `write_page`, `free_page`.
+**Backend** (`Backend` struct):
+Wraps a single SQLite connection opened in WAL journal mode. Holds the active
+embedding dimension and a `RetrievalConfig`. Provides `open`, `open_in_memory`,
+`store`, `load`, batch helpers, and `ensure_vector_index(dim)` to create or rebuild
+the vec0 projection and backfill it from canonical rows.
 
-**Write Ahead Log** (`wal.rs`):
-Every mutation goes to the WAL before touching data pages. Each entry is
-serialized as:
+**Canonical tables:**
 
-```
-[length: u32][lsn: u64][type: u8][page_id: u64][LZ4-compressed data][CRC32: u32]
-```
+- `schema_meta`: key/value for schema version and active embedding dimension.
+- `memories`: source of truth for content, metadata, temporal validity, salience,
+  confidence, and the original embedding bytes.
+- `memory_tags`: tag rows for filtering and scoped search.
+- `edges`: typed, weighted graph relationships as inspectable rows, traversed with
+  recursive CTEs.
+- `memory_sources`: provenance (conversation id, turn id, actor, extractor, prompt
+  hash, payload).
+- `entities`, `entity_aliases`, `memory_entities`: explicit entity links and aliases
+  used for entity-aware recall boosting.
+- `claims`, `claim_entity_links`, `claim_evidence`, `entity_relationships`,
+  `relationship_evidence`: extracted claims and structured relationships.
+- `retrieval_traces`, `retrieval_trace_hits`: per-recall audit of what was searched,
+  scored, and returned.
+- `memory_operations`: append-only write/lifecycle events for audit and debug.
 
-LZ4 compression reduces I/O for large payloads. CRC32 checksums catch torn writes
-on recovery. The WAL supports `append`, `sync`, `iterate` (for crash recovery),
-and `truncate` (after checkpoint).
+**Vector projection** (`memory_vec`):
+A `sqlite-vec` `vec0` virtual table over `float[dim]` embeddings. Created lazily by
+`ensure_vector_index` when the first embedding of a known dimension arrives, then
+backfilled from `memories`. Distance is computed as raw L2 over L2-normalized
+embeddings so smaller means more similar, without depending on a vec0 distance
+option. The projection can be dropped and rebuilt from canonical rows at any time.
 
-Entry types: `PageWrite` (data mutation), `Commit` (transaction boundary),
-`Checkpoint` (safe truncation point).
+**Keyword projection** (`memories_fts`):
+An FTS5 virtual table over memory content, used for BM25-ranked keyword search.
 
-**Buffer Pool** (`buffer.rs`):
-Sits between the page manager and the rest of the system. Uses CLOCK eviction
-(an approximation of LRU that avoids the overhead of maintaining a linked list
-on every access). Pages can be pinned to prevent eviction during active use.
-The pool is wrapped in a `parking_lot::Mutex` for thread safety. Default capacity is 1024 pages
-(16 MB of buffered data).
-
-**Storage Engine** (`engine.rs`):
-Wires page manager, WAL, and buffer pool together. Provides `store_memory`
-(serializes a `MemoryNode` to JSON, writes to an allocated page via WAL) and
-`load_memory` (reads a page, deserializes). Memory layout per page:
-`[length: u32 LE][JSON bytes]`.
-
-### mentedb-index
-
-Four index structures, each optimized for a different access pattern, managed
-by a unified `IndexManager` that coordinates hybrid queries.
-
-**HNSW Vector Index** (`hnsw.rs`):
-A from scratch implementation of Hierarchical Navigable Small World graphs for
-approximate nearest neighbor search. Configuration: M=16 (max connections per
-layer), ef_construction=200, ef_search=50, cosine distance by default. Supports
-insert, search (returns k nearest with distances), remove (tombstone), and
-serialize/deserialize for persistence.
-
-Why build HNSW from scratch instead of wrapping a library? Control. MenteDB needs
-to serialize the index into its own page format, evict graph layers under memory
-pressure, and integrate distance calculations with the salience scoring pipeline.
-A dependency like `hnswlib` would force an opaque memory model.
-
-**Bitmap Index** (`bitmap.rs`):
-Uses roaring bitmaps for set operations on tags. Each tag maps to a bitmap of
-integer encoded memory IDs. Supports AND (intersection) and OR (union) queries
-across multiple tags. Roaring bitmaps compress sparse integer sets far better than
-raw bitsets while still supporting O(1) membership tests.
-
-**Temporal Index** (`temporal.rs`):
-A `BTreeMap<Timestamp, Vec<MemoryId>>` that supports range queries ("give me
-everything from the last hour") and `latest(n)`. B-trees give O(log n) point
-lookups and efficient range iteration.
-
-**Salience Index** (`salience.rs`):
-Another B-tree, keyed by salience score. Supports `top_k` (highest salience
-first) and `update` (move a memory when its salience decays). This index is
-the backbone of the "what matters most" question that context assembly asks
-on every read.
-
-**Index Manager** (`manager.rs`):
-`index_memory` fans out a single `MemoryNode` to all four indexes. `hybrid_search`
-combines results with a weighted score:
-
-```
-final_score = vector_similarity * 0.6 + salience * 0.3 + recency * 0.1
-```
-
-This formula is intentionally simple and configurable. Vector similarity dominates
-because embeddings capture semantic intent. Salience rewards memories the agent
-has flagged as important. Recency provides a mild preference for fresh information.
+**Hybrid search:**
+Vector similarity (vec0) and keyword relevance (FTS5/BM25) are combined with tag,
+temporal, and salience signals using reciprocal rank fusion (RRF). Ranking weights
+are explicit `RetrievalConfig` fields, never magic constants. Each search records
+a `RetrievalTrace` when tracing is enabled so a bad recall can be explained after
+the fact.
 
 ### mentedb-graph
 
@@ -433,12 +398,15 @@ The entry point for library consumers. Re-exports subsystem crates:
 
 ```rust
 pub use mentedb_core as core;
-pub use mentedb_storage as storage;
-pub use mentedb_index as index;
+pub use mentedb_sqlite as sqlite;
 pub use mentedb_graph as graph;
 pub use mentedb_query as query;
 pub use mentedb_context as context;
 ```
+
+It also re-exports the SQLite inspection types (`Backend`, `RetrievalTrace`,
+`MemorySource`, `EntityRecord`, `ClaimRecord`, and friends) and the cognitive,
+consolidation, and extraction crates for downstream users.
 
 Provides a `prelude` module with the most common types and the `MenteDb`
 struct itself.
@@ -465,27 +433,27 @@ Client
   v
 MenteDb::store(node)
   |
-  +---> StorageEngine::store_memory(node)
+  +---> Backend::store(node)
   |       |
-  |       +---> WAL::append(PageWrite, page_id, serialized_json)
-  |       +---> PageManager::allocate_page()
-  |       +---> BufferPool::update_page(page_id, page)
-  |
-  +---> IndexManager::index_memory(node)
+  |       +---> INSERT INTO memories (...)   // canonical row (content, meta,
+  |       |                                   //   temporal, salience, embedding)
+  |       +---> INSERT INTO memory_tags (...)  // for each tag
+  |       +---> memory_operations append      // audit/lifecycle event
   |       |
-  |       +---> HnswIndex::insert(id, embedding)
-  |       +---> BitmapIndex::add_tag(id, tag)  // for each tag
-  |       +---> TemporalIndex::insert(id, created_at)
-  |       +---> SalienceIndex::insert(id, salience)
+  |       +---> ensure_vector_index(dim)      // lazy: create vec0 + backfill
+  |       +---> INSERT INTO memory_vec (...)   // vec0 projection row
+  |       +---> INSERT INTO memories_fts (...) // FTS5 projection row
   |
-  +---> GraphManager::add_memory(id)
+  +---> GraphManager::add_memory(id)          // in-memory CSR mirror
           |
           +---> CsrGraph::add_node(id)
+          +---> edges row stays canonical in SQLite
 ```
 
 At write time, the cognitive subsystem (if wired in) runs
 `WriteInferenceEngine::infer_on_write` to detect contradictions,
-create edges, and propagate belief changes.
+create edges, and propagate belief changes. Edges are persisted to the
+`edges` table and mirrored in the in-memory graph.
 
 ### Read Path
 
@@ -504,14 +472,15 @@ MenteDb::recall(mql_string)
   +---> execute_plan(plan)
   |       |
   |       +---> (match on plan type)
-  |       |       VectorSearch  -> IndexManager::hybrid_search
-  |       |       TagScan       -> BitmapIndex + hybrid_search
-  |       |       TemporalScan  -> TemporalIndex + hybrid_search
-  |       |       GraphTraversal -> GraphManager::get_context_subgraph
-  |       |       PointLookup   -> StorageEngine::load_memory
+  |       |       VectorSearch   -> Backend::recall_hybrid (vec0 KNN)
+  |       |       TagScan        -> memory_tags filter + hybrid search
+  |       |       TemporalScan   -> memories validity range + hybrid search
+  |       |       GraphTraversal -> recursive CTE over edges
+  |       |       PointLookup    -> SELECT from memories by id
   |       |
   |       +---> load_scored_memories(hits)
-  |               +---> StorageEngine::load_memory(page_id) for each hit
+  |               +---> SELECT from memories for each hit id
+  |               +---> record retrieval_trace + retrieval_trace_hits (if tracing)
   |
   +---> ContextAssembler::assemble(scored_memories, edges, config)
           |
@@ -528,38 +497,40 @@ MenteDb::recall(mql_string)
 Memory safety without garbage collection. AI agent memory databases run as
 long lived services processing concurrent requests. Rust's ownership model
 eliminates use after free, data races, and null pointer bugs at compile time.
-The zero cost abstractions mean hand written HNSW and CSR implementations
+The zero cost abstractions mean the hand written CSR graph and query planner
 run as fast as C equivalents. The type system catches misuse of MemoryId vs
 AgentId vs SpaceId at compile time.
 
-### Why Custom Storage vs SQLite
+### Why SQLite for Durable Storage
 
-SQLite is an excellent general purpose embedded database, but it imposes
-decisions that conflict with MenteDB's requirements:
+The original MenteDB implementation shipped a custom page store, WAL, buffer
+pool, and hand written HNSW index. This fork moved durable storage to SQLite
+because maintaining a database engine and a memory product at the same time is
+not the right tradeoff. SQLite brings:
 
-1. **Page format control**: MenteDB needs to co-locate memory embeddings
-   with metadata on the same page for cache friendly access. SQLite's
-   B-tree pages don't support this layout.
-2. **WAL integration**: MenteDB's WAL carries LZ4 compressed payloads
-   and integrates with the cognitive checkpoint system. SQLite's WAL is
-   a black box.
-3. **Buffer pool policy**: CLOCK eviction is chosen specifically because
-   MenteDB's access pattern (repeated scans during hybrid search) would
-   thrash an LRU pool. CLOCK gives a second chance to recently accessed
-   pages.
+1. **Inspectable rows**: memories, edges, provenance, entities, and retrieval
+   traces are normal SQL tables you can query with the `sqlite3` CLI during
+   debugging.
+2. **Rebuildable projections**: `sqlite-vec` and FTS5 are derived from canonical
+   rows, so a vector or keyword index can be dropped and rebuilt without data loss
+   if the embedding model or dimension changes.
+3. **Battle tested durability**: SQLite's WAL gives crash recovery and concurrent
+   readers for free, so the project can focus on memory and cognition rather than
+   re implementing a storage engine.
 
-### Why HNSW from Scratch
+### Why sqlite-vec for Vector Search
 
-HNSW is the standard algorithm for approximate nearest neighbor search in
-high dimensional spaces. Building it from scratch gives MenteDB:
+`sqlite-vec` provides a `vec0` virtual table for approximate nearest neighbor
+search over `float[dim]` embeddings. Using it gives the engine:
 
-1. **Serialization control**: The index serializes into MenteDB's own page
-   format, so it participates in WAL, buffer pool, and checkpoint.
-2. **Memory pressure awareness**: Individual graph layers can be evicted
-   under memory pressure instead of keeping the entire index in RAM.
-3. **Custom distance functions**: Cosine, Euclidean, and dot product are
-   built in, but the architecture allows plugging in domain specific
-   metrics.
+1. **Rebuildability**: the projection is derived from canonical `memories` rows, so
+   it participates in the same rebuild story as FTS5 rather than being a separate,
+   opaque index file.
+2. **SQL native queries**: KNN search runs inside SQL and composes with tag,
+   temporal, salience, and entity filters in a single query plan.
+3. **Lazy initialization**: the vec0 table is created and backfilled on demand by
+   `ensure_vector_index(dim)` when the first embedding of a known dimension
+   arrives, so an empty database needs no up front dimension choice.
 
 ### Why CSR for Graphs
 
@@ -590,12 +561,13 @@ and maintain. The hand written approach gives:
 
 ### Configurable Heuristics
 
-Every threshold in MenteDB is configurable: contradiction similarity (0.95),
+Every threshold in Grasp is configurable: contradiction similarity (0.95),
 related edge range (0.6 to 0.85), salience decay half life (7 days), budget
-zone percentages, HNSW parameters, belief propagation factors. The defaults
-are reasonable starting points, but AI agent behavior varies widely. A coding
-assistant has different memory patterns than a customer support bot. Making
-everything configurable lets operators tune without forking the engine.
+zone percentages, hybrid retrieval RRF weights (in `RetrievalConfig`), belief
+propagation factors. The defaults are reasonable starting points, but AI agent
+behavior varies widely. A coding assistant has different memory patterns than a
+customer support bot. Making everything configurable lets operators tune without
+forking the engine.
 
 ## Cognitive Features: The Seven Radical Capabilities
 
@@ -707,44 +679,53 @@ All fallible operations return `MenteResult<T>`, which is
 | Variant | When |
 |---------|------|
 | `MemoryNotFound(MemoryId)` | Lookup or delete of a nonexistent memory |
-| `Storage(String)` | Page I/O, WAL corruption, serialization failure |
-| `Index(String)` | HNSW dimension mismatch, bitmap overflow |
+| `Storage(String)` | SQLite write/read failure, schema, or projection error |
+| `Index(String)` | Vector index setup or rebuild error (vec0 creation/backfill) |
 | `Query(String)` | MQL parse error with position information |
 | `Serialization(String)` | Encode/decode failure (JSON or bincode) |
-| `CapacityExceeded(String)` | Buffer pool full, space limit reached |
+| `InvalidInput(String)` | Caller supplied an invalid argument |
+| `CapacityExceeded(String)` | Space or budget limit reached |
+| `EmbeddingDimensionMismatch` | An embedding does not match the active vec0 dimension |
 | `PermissionDenied { agent_id, space_id }` | Access control violation |
 | `Io(std::io::Error)` | Underlying filesystem error |
 
 ## Thread Safety & Concurrency
 
-MenteDB uses **interior mutability** throughout — each component manages its own
-fine-grained locking. The server holds `Arc<MenteDb>` (no external lock).
+Grasp uses **interior mutability** throughout. The facade holds all subsystems
+by value with `&self` methods, so the server shares `Arc<MenteDb>` with no
+external lock.
 
 | Component | Lock Type | Scope |
 |-----------|-----------|-------|
-| `StorageEngine` | `parking_lot::Mutex` on PageManager + WAL | Per-operation |
-| `BufferPool` | `parking_lot::Mutex` on inner state | Page fetch/evict |
+| `Backend` | `parking_lot::Mutex` on the SQLite `Connection` | Per operation (WAL mode lets readers not block the writer) |
+| `Backend` retrieval config | `parking_lot::RwLock` on `RetrievalConfig` | Read: ranking, Write: config swap |
+| `Backend` tracing/dimension | `AtomicBool` / `AtomicUsize` | Lock-free flags |
 | `GraphManager` | `parking_lot::RwLock` on CsrGraph | Read: traversal/search, Write: add/remove |
-| `IndexManager` | `parking_lot::RwLock` per index (5 indexes) | Read: search, Write: insert/remove |
-| `page_map` | `parking_lot::RwLock` on HashMap | Read: lookups, Write: store/forget |
 | `EventBus` | `RwLock` for subscriber list | Publish/subscribe |
+| `PainRegistry` / `TrajectoryTracker` / `PhantomTracker` | `RwLock` each | Cognitive state |
 | `CognitionStream` | `Mutex` on ring buffer | Token feed/drain |
 
 **Lock ordering** (prevents deadlocks):
-1. `page_map` → `StorageEngine` (never reverse)
-2. WAL lock → PageManager lock (released before buffer pool)
-3. Graph lock is independent (never held with page_map or storage)
+1. `Backend` connection is held for a single operation and released before any
+   cognitive or graph lock is taken.
+2. Graph lock is independent of the connection.
 
 **Concurrency benefits:**
-- All read operations (recall, search, get_memory, stats) run concurrently with zero contention
-- Write operations only lock the specific component being mutated
-- LLM extraction runs in a background `tokio::spawn` task — no lock held during API calls
+- All read operations (recall, search, get_memory, stats) run concurrently with
+  zero contention outside their specific component lock.
+- SQLite WAL mode allows concurrent readers alongside the single writer.
+- LLM extraction runs in a background `tokio::spawn` task with no storage lock
+  held during API calls.
 
 ## Index Persistence
 
-Indexes are persisted as **bincode** binary format for fast serialization (~5x smaller,
-~10x faster than JSON). On load, indexes auto-detect and migrate from legacy JSON format.
-MemoryNode pages and the knowledge graph use JSON due to `skip_serializing_if` compatibility.
+The durable source of truth is the SQLite `memories` table. The vector and
+keyword projections (`memory_vec` via `sqlite-vec`, and `memories_fts` via FTS5)
+are rebuildable from canonical rows. `ensure_vector_index(dim)` drops and recreates
+the vec0 table at a new dimension and backfills it, and the FTS5 projection can be
+regenerated the same way. This means changing embedding models or dimensions never
+loses memory content. Graph edges, provenance, entities, and retrieval traces are
+persisted as ordinary SQL tables.
 
 ## Testing Strategy
 
@@ -754,12 +735,10 @@ tested with `cargo test --workspace`.
 
 Key test categories:
 
-- **Storage**: Page allocation round trips, WAL crash recovery, buffer
-  pool eviction under pressure
-- **Index**: HNSW recall accuracy, bitmap set operations, temporal range
-  correctness
+- **SQLite backend**: store/load round trips, vec0 creation and backfill, FTS5
+  recall, hybrid RRF ranking, retrieval trace capture
 - **Graph**: CSR compaction correctness, traversal depth limits, belief
-  propagation convergence
+  propagation convergence, recursive CTE traversal
 - **Query**: MQL parsing of every statement type, planner output
   verification
 - **Context**: Token budget enforcement, zone classification, delta

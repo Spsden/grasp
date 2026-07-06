@@ -3,8 +3,6 @@ exclude = ["sdks/typescript"]
 members = [
     "crates/mentedb",
     "crates/mentedb-core",
-    "crates/mentedb-storage",
-    "crates/mentedb-index",
     "crates/mentedb-graph",
     "crates/mentedb-query",
     "crates/mentedb-context",
@@ -13,7 +11,6 @@ members = [
     "crates/mentedb-consolidation",
     "crates/mentedb-embedding",
     "crates/mentedb-extraction",
-    "crates/mentedb-replication",
     "crates/mentedb-sqlite",
 ]
 resolver = "2"
@@ -65,8 +62,6 @@ tracing-subscriber = "0.3"
 # Internal crates
 mentedb = { path = "crates/mentedb", version = "0.9.2" }
 mentedb-core = { path = "crates/mentedb-core", version = "0.9.2" }
-mentedb-storage = { path = "crates/mentedb-storage", version = "0.9.2" }
-mentedb-index = { path = "crates/mentedb-index", version = "0.9.2" }
 mentedb-graph = { path = "crates/mentedb-graph", version = "0.9.2" }
 mentedb-query = { path = "crates/mentedb-query", version = "0.9.2" }
 mentedb-context = { path = "crates/mentedb-context", version = "0.9.2" }

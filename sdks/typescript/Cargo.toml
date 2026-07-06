@@ -12,8 +12,6 @@ crate-type = ["cdylib"]
 napi = { version = "2", features = ["napi9", "serde-json"] }
 napi-derive = "2"
 mentedb-core = { path = "../../crates/mentedb-core" }
-mentedb-storage = { path = "../../crates/mentedb-storage" }
-mentedb-index = { path = "../../crates/mentedb-index" }
 mentedb-graph = { path = "../../crates/mentedb-graph" }
 mentedb-context = { path = "../../crates/mentedb-context" }
 mentedb-cognitive = { path = "../../crates/mentedb-cognitive" }

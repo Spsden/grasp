@@ -43,9 +43,7 @@ jobs:
             mentedb-context
             mentedb-embedding
             mentedb-graph
-            mentedb-index
             mentedb-query
-            mentedb-storage
             mentedb-consolidation
             mentedb-extraction
             mentedb

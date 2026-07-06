@@ -220,11 +220,8 @@ Recall is currently a blend of:
 | `mentedb-embedding` | embedding provider abstraction and providers, pending rename |
 | `mentedb-extraction` | LLM extraction support, still evolving, pending rename |
 | `mentedb-graph` | in-memory graph algorithms used by cognitive features, pending rename |
-| `mentedb-index` | legacy and algorithmic index structures still present in workspace, pending rename |
 | `mentedb-query` | MQL parser and planner, pending rename |
 | `mentedb-server` | REST and gRPC server, pending rename |
-| `mentedb-storage` | compatibility storage crate, currently simplified after SQLite move, pending rename |
-| `mentedb-replication` | experimental Raft replication layer, pending rename |
 
 ## Configuration
 

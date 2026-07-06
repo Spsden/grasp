@@ -38,7 +38,7 @@ Run tests for a specific crate:
 
 ```bash
 cargo test -p mentedb-core
-cargo test -p mentedb-storage
+cargo test -p mentedb-sqlite
 cargo test -p mentedb-cognitive
 ```
 
@@ -246,7 +246,7 @@ fn hnsw_search_returns_k_nearest_neighbors() { ... }
 
 ```bash
 cargo test -p mentedb-core test_name
-cargo test -p mentedb-storage -- --nocapture
+cargo test -p mentedb-sqlite -- --nocapture
 ```
 
 ## Questions

@@ -20,11 +20,7 @@ changelog_include = ["mentedb-core", "mentedb-cognitive"]
 name = "mentedb"
 changelog_include = ["mentedb-core", "mentedb-cognitive", "mentedb-consolidation", "mentedb-extraction"]
 
-# SDKs are versioned via workspace but not published to crates.io
-[[package]]
-name = "mentedb-replication"
-release = false
-
+# The server crate is versioned via workspace but not published to crates.io
 [[package]]
 name = "mentedb-server"
 release = false

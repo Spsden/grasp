@@ -88,8 +88,6 @@ pub use mentedb_context as context;
 pub use mentedb_core as core;
 /// Knowledge graph engine.
 pub use mentedb_graph as graph;
-/// Index structures for vector, tag, temporal, and salience search.
-pub use mentedb_index as index;
 /// MQL parser and query planner.
 pub use mentedb_query as query;
 /// SQLite storage backend and inspection types.
