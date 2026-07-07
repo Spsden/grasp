@@ -327,6 +327,55 @@ fn test_correction_policy_invalidates_old_derived_truth() {
 }
 
 #[test]
+fn test_enrichment_policy_links_without_invalidating_memories() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = MenteDb::open(dir.path()).unwrap();
+
+    let broad = make_memory("User prefers Rust.", Vec::new());
+    let broad_id = broad.id;
+    db.store(broad).unwrap();
+    let detail = make_memory(
+        "User prefers Rust for memory safety and zero cost abstractions.",
+        Vec::new(),
+    );
+    let detail_id = detail.id;
+    db.store(detail).unwrap();
+
+    let mut request = EnrichmentRequest::new(detail_id, broad_id);
+    request.reason = Some("new memory adds durable detail".to_string());
+    let report = db.apply_enrichment_policy(request).unwrap();
+
+    assert_eq!(report.actions, 1);
+    assert!(
+        db.get_memory(broad_id)
+            .unwrap()
+            .is_valid_at(current_test_time())
+    );
+    assert!(
+        db.lifecycle_events_for_memory(broad_id, 10)
+            .unwrap()
+            .iter()
+            .any(|event| event.event_type == "enriched_by")
+    );
+
+    let graph = db.graph().graph();
+    let has_support_edge = graph
+        .outgoing(detail_id)
+        .iter()
+        .any(|(target, edge)| *target == broad_id && edge.edge_type == EdgeType::Supports);
+    assert!(
+        has_support_edge,
+        "Detailed memory should support the broader memory"
+    );
+
+    let run = db.recent_policy_runs(1).unwrap().remove(0);
+    assert_eq!(run.policy_name, "enrichment");
+    assert_eq!(db.policy_actions_for_run(&run.run_id).unwrap().len(), 1);
+
+    db.close().unwrap();
+}
+
+#[test]
 fn test_forget_policy_hard_removes_derived_artifacts() {
     let dir = tempfile::tempdir().unwrap();
     let db = MenteDb::open(dir.path()).unwrap();

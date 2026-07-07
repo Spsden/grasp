@@ -125,7 +125,8 @@ pub use graph_projection::{
     GraphProjection, GraphProjectionConfig, GraphProjectionEdge, GraphProjectionNode,
 };
 pub use policies::{
-    CorrectionRequest, ForgetMode, ForgetScope, PolicyAffected, PolicyPlan, PolicyReport,
+    CorrectionRequest, EnrichmentRequest, ForgetMode, ForgetScope, PolicyAffected, PolicyPlan,
+    PolicyReport,
 };
 pub use sleep::{
     SleepMaintenanceConfig, SleepMaintenanceIssue, SleepMaintenanceLease, SleepMaintenanceResult,
@@ -152,7 +153,8 @@ pub mod prelude {
     };
     pub use crate::extraction_jobs::{ValidatedExtractionBatch, validate_extraction_batch};
     pub use crate::policies::{
-        CorrectionRequest, ForgetMode, ForgetScope, PolicyAffected, PolicyPlan, PolicyReport,
+        CorrectionRequest, EnrichmentRequest, ForgetMode, ForgetScope, PolicyAffected, PolicyPlan,
+        PolicyReport,
     };
 }
 

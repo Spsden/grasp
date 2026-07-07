@@ -60,6 +60,8 @@ impl<T: LlmJudge> LlmJudge for std::sync::Arc<T> {
 pub enum InvalidationVerdict {
     /// Both memories are valid and describe different facts.
     Keep { reason: String },
+    /// The new memory adds durable detail while the old memory remains true.
+    Enrich { reason: String },
     /// The new memory makes the old one no longer true.
     Invalidate { reason: String },
     /// The old memory should be updated with new information.
@@ -174,11 +176,15 @@ mod prompts {
 Given an EXISTING memory and a NEW memory, determine the relationship:
 
 - "keep": Both memories are valid. They describe different facts or the old one is still true.
-- "invalidate": The new memory makes the old one no longer true. Example: old says "Alice works at Acme", new says "Alice joined Google" — the old employment fact is now outdated.
-- "update": The old memory should be updated to incorporate new information. Example: old says "project uses React", new says "project migrated from React to Vue" — merge into one memory.
+- "enrich": The new memory adds durable detail, evidence, or specificity while the old memory remains true. Keep both and link the new memory as supporting detail.
+- "invalidate": The new memory makes the old one no longer true. Example: old says "Alice works at Acme", new says "Alice joined Google", so the old employment fact is outdated.
+- "update": The old memory and new memory should be synthesized into one richer derived claim. Use this sparingly, only when a single merged claim is clearly better than keeping both.
+
+Prefer "enrich" over "update" when the existing memory is still true and the new memory adds details such as reasons, dates, implementation details, evidence, or context.
 
 Respond with ONLY a JSON object. Examples:
 {"verdict": "keep", "reason": "These describe different aspects of the same topic"}
+{"verdict": "enrich", "reason": "The new memory explains why the old preference exists while preserving the old fact"}
 {"verdict": "invalidate", "reason": "The user changed jobs, old employment is outdated"}
 {"verdict": "update", "merged_content": "Project migrated from React to Vue in Q2", "reason": "The new memory adds temporal context to the old one"}"#;
 
@@ -191,6 +197,7 @@ Given two memories A and B, determine their relationship:
 - "supersedes": One replaces the other due to a change over time (not a logical contradiction but a temporal update).
 
 For "supersedes", include which memory wins using its ID.
+Choose "supersedes" rather than "contradicts" when a newer memory uses temporal replacement language such as upgraded, migrated, switched, moved, relocated, renamed, replaced, rewrote, now, currently, no longer, or launched a new version.
 
 Respond with ONLY a JSON object. Examples:
 {"verdict": "compatible", "reason": "These describe different topics"}
@@ -703,6 +710,44 @@ mod tests {
             }
             other => panic!("Expected Update, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn test_judge_invalidation_enrich() {
+        let judge = MockLlmJudge::new(
+            r#"{"verdict": "enrich", "reason": "The new memory adds implementation detail"}"#,
+        );
+        let svc = CognitiveLlmService::new(judge);
+
+        let result = svc
+            .judge_invalidation(
+                &mem("Uses Docker for deployment"),
+                &mem("Uses Docker with Kubernetes orchestration"),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(result, InvalidationVerdict::Enrich { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_invalidation_prompt_names_enrichment() {
+        let judge = std::sync::Arc::new(CapturingJudge::new(
+            r#"{"verdict": "enrich", "reason": "The new memory adds durable detail"}"#,
+        ));
+        let svc = CognitiveLlmService::new(judge.clone());
+
+        let _ = svc
+            .judge_invalidation(
+                &mem("User prefers Rust"),
+                &mem("User prefers Rust for safety"),
+            )
+            .await
+            .unwrap();
+
+        let calls = judge.calls();
+        assert!(calls[0].0.contains("\"enrich\""));
+        assert!(calls[0].0.contains("Keep both and link"));
     }
 
     #[tokio::test]

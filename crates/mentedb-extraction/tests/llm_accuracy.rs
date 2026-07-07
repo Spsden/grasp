@@ -223,31 +223,31 @@ const INVALIDATION_CASES: &[InvalidationCase] = &[
     InvalidationCase {
         old: "User prefers Rust",
         new: "User prefers Rust specifically for its memory safety and zero cost abstractions",
-        expected: "update",
+        expected: "update,enrich",
         description: "adds detail to preference",
     },
     InvalidationCase {
         old: "Project deadline is Q2",
         new: "Project deadline confirmed as June 30, end of Q2",
-        expected: "update",
+        expected: "update,enrich",
         description: "adds specific date",
     },
     InvalidationCase {
         old: "Uses Docker for deployment",
         new: "Uses Docker with Kubernetes orchestration in production",
-        expected: "update",
+        expected: "update,enrich",
         description: "adds orchestration detail",
     },
     InvalidationCase {
         old: "API follows REST",
         new: "API follows REST with OpenAPI 3.0 spec at /docs endpoint",
-        expected: "update",
+        expected: "update,enrich",
         description: "adds spec detail",
     },
     InvalidationCase {
         old: "Team has 5 engineers",
         new: "Team grew to 5 engineers after hiring 2 juniors last month",
-        expected: "update",
+        expected: "update,enrich",
         description: "adds hiring context",
     },
 ];
@@ -610,6 +610,7 @@ async fn llm_accuracy_invalidation() {
         let result = svc.judge_invalidation(&old, &new).await;
         let actual = match &result {
             Ok(InvalidationVerdict::Keep { .. }) => "keep",
+            Ok(InvalidationVerdict::Enrich { .. }) => "enrich",
             Ok(InvalidationVerdict::Invalidate { .. }) => "invalidate",
             Ok(InvalidationVerdict::Update { .. }) => "update",
             Err(e) => {
@@ -790,6 +791,7 @@ async fn llm_accuracy_full_report() {
             .await;
         let actual = match &result {
             Ok(InvalidationVerdict::Keep { .. }) => "keep",
+            Ok(InvalidationVerdict::Enrich { .. }) => "enrich",
             Ok(InvalidationVerdict::Invalidate { .. }) => "invalidate",
             Ok(InvalidationVerdict::Update { .. }) => "update",
             Err(_) => "error",

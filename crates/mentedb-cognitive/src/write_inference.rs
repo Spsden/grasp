@@ -263,6 +263,15 @@ impl WriteInferenceEngine {
                             });
                             continue;
                         }
+                        InvalidationVerdict::Enrich { reason: _ } => {
+                            actions.push(InferredAction::CreateEdge {
+                                source: new_memory.id,
+                                target: existing.id,
+                                edge_type: EdgeType::Supports,
+                                weight: sim.clamp(0.7, 0.95),
+                            });
+                            continue;
+                        }
                         InvalidationVerdict::Keep { .. } => {
                             // Fall through to contradiction check
                         }
@@ -276,11 +285,28 @@ impl WriteInferenceEngine {
                 {
                     match verdict {
                         ContradictionVerdict::Contradicts { reason } => {
-                            actions.push(InferredAction::FlagContradiction {
-                                existing: existing.id,
-                                new: new_memory.id,
-                                reason,
-                            });
+                            if let Some(winner) =
+                                temporal_supersession_winner(&old_summary, &new_summary)
+                            {
+                                let winner_is_new = winner == new_memory.id;
+                                let (obsolete, superseder) = if winner_is_new {
+                                    (existing.id, new_memory.id)
+                                } else {
+                                    (new_memory.id, existing.id)
+                                };
+                                push_supersession_actions(
+                                    &mut actions,
+                                    obsolete,
+                                    superseder,
+                                    new_memory.created_at,
+                                );
+                            } else {
+                                actions.push(InferredAction::FlagContradiction {
+                                    existing: existing.id,
+                                    new: new_memory.id,
+                                    reason,
+                                });
+                            }
                         }
                         ContradictionVerdict::Supersedes { winner, reason: _ } => {
                             let winner_is_new = winner == new_memory.id.to_string();
@@ -289,21 +315,12 @@ impl WriteInferenceEngine {
                             } else {
                                 (new_memory.id, existing.id)
                             };
-                            actions.push(InferredAction::MarkObsolete {
-                                memory: obsolete,
-                                superseded_by: superseder,
-                            });
-                            actions.push(InferredAction::InvalidateMemory {
-                                memory: obsolete,
-                                superseded_by: superseder,
-                                valid_until: new_memory.created_at,
-                            });
-                            actions.push(InferredAction::CreateEdge {
-                                source: superseder,
-                                target: obsolete,
-                                edge_type: EdgeType::Supersedes,
-                                weight: 1.0,
-                            });
+                            push_supersession_actions(
+                                &mut actions,
+                                obsolete,
+                                superseder,
+                                new_memory.created_at,
+                            );
                         }
                         ContradictionVerdict::Compatible { .. } => {}
                     }
@@ -373,13 +390,104 @@ fn memory_to_summary(m: &MemoryNode) -> MemorySummary {
     }
 }
 
+fn push_supersession_actions(
+    actions: &mut Vec<InferredAction>,
+    obsolete: MemoryId,
+    superseder: MemoryId,
+    valid_until: u64,
+) {
+    actions.push(InferredAction::MarkObsolete {
+        memory: obsolete,
+        superseded_by: superseder,
+    });
+    actions.push(InferredAction::InvalidateMemory {
+        memory: obsolete,
+        superseded_by: superseder,
+        valid_until,
+    });
+    actions.push(InferredAction::CreateEdge {
+        source: superseder,
+        target: obsolete,
+        edge_type: EdgeType::Supersedes,
+        weight: 1.0,
+    });
+}
+
+fn temporal_supersession_winner(a: &MemorySummary, b: &MemorySummary) -> Option<MemoryId> {
+    if a.created_at == b.created_at {
+        return None;
+    }
+    let newer = if a.created_at > b.created_at { a } else { b };
+    if has_temporal_replacement_cue(&newer.content) {
+        Some(newer.id)
+    } else {
+        None
+    }
+}
+
+fn has_temporal_replacement_cue(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    const CUES: &[&str] = &[
+        "now ",
+        "currently",
+        "no longer",
+        "switched",
+        "migrated",
+        "upgraded",
+        "replaced",
+        "moved",
+        "relocated",
+        "renamed",
+        "rewrote",
+        "launched version",
+        "started at",
+        "joined",
+        "changed to",
+        "instead",
+    ];
+    CUES.iter().any(|cue| text.contains(cue))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use mentedb_core::memory::MemoryType;
     use mentedb_core::types::AgentId;
+    use std::sync::Mutex;
 
-    use crate::llm::MockLlmJudge;
+    use crate::llm::{LlmJudgeError, MockLlmJudge};
+
+    struct SequenceJudge {
+        responses: Mutex<Vec<String>>,
+    }
+
+    impl SequenceJudge {
+        fn new(responses: Vec<&str>) -> Self {
+            Self {
+                responses: Mutex::new(
+                    responses
+                        .into_iter()
+                        .rev()
+                        .map(ToString::to_string)
+                        .collect(),
+                ),
+            }
+        }
+    }
+
+    impl LlmJudge for SequenceJudge {
+        async fn complete(
+            &self,
+            _system_prompt: &str,
+            _user_prompt: &str,
+        ) -> Result<String, LlmJudgeError> {
+            self.responses
+                .lock()
+                .unwrap()
+                .pop()
+                .ok_or_else(|| LlmJudgeError::ProviderError("no mock response left".to_string()))
+        }
+    }
 
     fn make_memory(content: &str, embedding: Vec<f32>, mem_type: MemoryType) -> MemoryNode {
         let mut m = MemoryNode::new(AgentId::new(), mem_type, content.to_string(), embedding);
@@ -505,6 +613,104 @@ mod tests {
                 .any(|a| matches!(a, InferredAction::UpdateContent { .. })),
             "Expected UpdateContent from LLM update verdict, got: {:?}",
             actions
+        );
+    }
+
+    #[tokio::test]
+    async fn test_llm_enrich_creates_support_edge() {
+        let agent = AgentId::new();
+        let mut existing = make_memory(
+            "User prefers Rust",
+            vec![0.8, 0.6, 0.0],
+            MemoryType::Semantic,
+        );
+        existing.agent_id = agent;
+
+        let mut new_mem = make_memory(
+            "User prefers Rust for memory safety",
+            vec![0.78, 0.62, 0.0],
+            MemoryType::Semantic,
+        );
+        new_mem.agent_id = agent;
+        new_mem.created_at = 2000;
+
+        let judge = MockLlmJudge::new(
+            r#"{"verdict": "enrich", "reason": "new memory adds durable detail"}"#,
+        );
+        let llm = CognitiveLlmService::new(judge);
+        let engine = WriteInferenceEngine::new();
+        let actions = engine
+            .infer_on_write_with_llm(&new_mem, &[existing.clone()], &[], &llm)
+            .await;
+
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                InferredAction::CreateEdge {
+                    source,
+                    target,
+                    edge_type: EdgeType::Supports,
+                    ..
+                } if *source == new_mem.id && *target == existing.id
+            )),
+            "Expected Supports edge from LLM enrich verdict, got: {:?}",
+            actions
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, InferredAction::InvalidateMemory { .. })),
+            "Enrichment must not invalidate the old memory",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_temporal_cue_turns_contradiction_into_supersession() {
+        let agent = AgentId::new();
+        let mut existing = make_memory(
+            "Using React 17",
+            vec![0.99, 0.01, 0.0],
+            MemoryType::Semantic,
+        );
+        existing.agent_id = agent;
+        existing.created_at = 1000;
+
+        let mut new_mem = make_memory(
+            "Upgraded to React 18 last week",
+            vec![0.98, 0.02, 0.0],
+            MemoryType::Semantic,
+        );
+        new_mem.agent_id = agent;
+        new_mem.created_at = 2000;
+
+        let judge = SequenceJudge::new(vec![
+            r#"{"verdict": "keep", "reason": "defer to contradiction check"}"#,
+            r#"{"verdict": "contradicts", "reason": "versions conflict"}"#,
+        ]);
+        let llm = CognitiveLlmService::new(judge);
+        let engine = WriteInferenceEngine::new();
+        let actions = engine
+            .infer_on_write_with_llm(&new_mem, &[existing.clone()], &[], &llm)
+            .await;
+
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                InferredAction::CreateEdge {
+                    source,
+                    target,
+                    edge_type: EdgeType::Supersedes,
+                    ..
+                } if *source == new_mem.id && *target == existing.id
+            )),
+            "Expected temporal supersession, got: {:?}",
+            actions
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, InferredAction::FlagContradiction { .. })),
+            "Temporal replacement should not be left as a plain contradiction",
         );
     }
 

@@ -74,6 +74,26 @@ impl CorrectionRequest {
     }
 }
 
+/// Request to link a richer memory as supporting detail for an existing memory.
+#[derive(Debug, Clone)]
+pub struct EnrichmentRequest {
+    pub source_memory_id: MemoryId,
+    pub target_memory_id: MemoryId,
+    pub reason: Option<String>,
+    pub weight: f32,
+}
+
+impl EnrichmentRequest {
+    pub fn new(source_memory_id: MemoryId, target_memory_id: MemoryId) -> Self {
+        Self {
+            source_memory_id,
+            target_memory_id,
+            reason: None,
+            weight: 0.85,
+        }
+    }
+}
+
 /// IDs affected by one policy plan.
 #[derive(Debug, Clone, Default)]
 pub struct PolicyAffected {
@@ -156,6 +176,41 @@ impl MenteDb {
         for edge in &edges {
             let _ = self.graph.add_relationship(edge);
         }
+
+        Ok(PolicyReport {
+            run_id: plan.run.run_id.clone(),
+            actions: plan.actions.len(),
+            affected: plan.affected,
+        })
+    }
+
+    /// Preview an enrichment link without mutating storage.
+    pub fn preview_enrichment_policy(&self, request: EnrichmentRequest) -> MenteResult<PolicyPlan> {
+        self.build_enrichment_plan(request, false)
+    }
+
+    /// Link a richer memory to an existing memory without invalidating either.
+    pub fn apply_enrichment_policy(&self, request: EnrichmentRequest) -> MenteResult<PolicyReport> {
+        let plan = self.build_enrichment_plan(request.clone(), true)?;
+        let now = plan.run.completed_at.unwrap_or_else(current_time_us);
+        let edge = enrichment_edge(&request, now);
+        let edges = vec![edge.clone()];
+        let lifecycle_events = enrichment_lifecycle_events(&plan, &request, now);
+        let memory_invalidations: Vec<(MemoryId, Timestamp)> = Vec::new();
+        let corrected_claim_ids: Vec<String> = Vec::new();
+        let corrected_relationship_ids: Vec<String> = Vec::new();
+
+        self.db.apply_correction_policy(CorrectionPolicyMutation {
+            run: &plan.run,
+            actions: &plan.actions,
+            memory_invalidations: &memory_invalidations,
+            corrected_claim_ids: &corrected_claim_ids,
+            corrected_relationship_ids: &corrected_relationship_ids,
+            edges: &edges,
+            lifecycle_events: &lifecycle_events,
+            applied_at: now,
+        })?;
+        let _ = self.graph.add_relationship(&edge);
 
         Ok(PolicyReport {
             run_id: plan.run.run_id.clone(),
@@ -493,6 +548,62 @@ impl MenteDb {
         Ok(())
     }
 
+    fn build_enrichment_plan(
+        &self,
+        request: EnrichmentRequest,
+        apply: bool,
+    ) -> MenteResult<PolicyPlan> {
+        let _source = self.get_memory(request.source_memory_id)?;
+        let _target = self.get_memory(request.target_memory_id)?;
+        let now = current_time_us();
+        let mut run = PolicyRun::new("enrichment", if apply { "apply" } else { "preview" });
+        run.status = if apply { "applied" } else { "planned" }.to_string();
+        run.scope_json = json!({
+            "source_memory_id": request.source_memory_id.to_string(),
+            "target_memory_id": request.target_memory_id.to_string(),
+            "edge_type": "Supports",
+            "reason": request.reason,
+        })
+        .to_string();
+        let affected = PolicyAffected {
+            memory_ids: vec![request.source_memory_id, request.target_memory_id],
+            ..Default::default()
+        };
+        run.result_json = affected.to_json().to_string();
+        if apply {
+            run.completed_at = Some(now);
+        }
+
+        let action_type = if apply {
+            "link_enrichment"
+        } else {
+            "would_link_enrichment"
+        };
+        let actions = vec![policy_action(
+            &run.run_id,
+            action_type,
+            "memory_edge",
+            Some(format!(
+                "{}->{}",
+                request.source_memory_id, request.target_memory_id
+            )),
+            json!({}),
+            json!({
+                "source_memory_id": request.source_memory_id.to_string(),
+                "target_memory_id": request.target_memory_id.to_string(),
+                "edge_type": "Supports",
+                "weight": normalized_weight(request.weight),
+            }),
+            apply,
+        )];
+
+        Ok(PolicyPlan {
+            run,
+            actions,
+            affected,
+        })
+    }
+
     fn build_forget_plan(
         &self,
         scope: ForgetScope,
@@ -655,6 +766,58 @@ impl MenteDb {
 
 pub(crate) fn memory_is_archived(memory: &MemoryNode) -> bool {
     memory.tags.iter().any(|tag| tag == "archived")
+}
+
+fn enrichment_edge(request: &EnrichmentRequest, now: Timestamp) -> MemoryEdge {
+    MemoryEdge {
+        source: request.source_memory_id,
+        target: request.target_memory_id,
+        edge_type: EdgeType::Supports,
+        weight: normalized_weight(request.weight),
+        created_at: now,
+        valid_from: None,
+        valid_until: None,
+        label: request.reason.clone(),
+    }
+}
+
+fn normalized_weight(weight: f32) -> f32 {
+    if weight.is_finite() {
+        weight.clamp(0.0, 1.0)
+    } else {
+        0.85
+    }
+}
+
+fn enrichment_lifecycle_events(
+    plan: &PolicyPlan,
+    request: &EnrichmentRequest,
+    now: Timestamp,
+) -> Vec<MemoryLifecycleEvent> {
+    vec![
+        lifecycle_event(
+            request.source_memory_id,
+            "enriched",
+            Some("enrichment_policy_applied"),
+            Some("enrichment"),
+            json!({
+                "run_id": plan.run.run_id,
+                "supports": request.target_memory_id.to_string(),
+                "applied_at": now,
+            }),
+        ),
+        lifecycle_event(
+            request.target_memory_id,
+            "enriched_by",
+            Some("enrichment_policy_applied"),
+            Some("enrichment"),
+            json!({
+                "run_id": plan.run.run_id,
+                "supported_by": request.source_memory_id.to_string(),
+                "applied_at": now,
+            }),
+        ),
+    ]
 }
 
 fn correction_lifecycle_events(
