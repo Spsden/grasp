@@ -96,6 +96,18 @@ fn verdict_matches(actual: &str, expected: &str) -> bool {
     expected.split(',').any(|e| e.trim() == actual)
 }
 
+async fn delay_between_llm_cases() {
+    let Ok(raw_ms) = std::env::var("LLM_ACCURACY_DELAY_MS") else {
+        return;
+    };
+    let Ok(ms) = raw_ms.parse::<u64>() else {
+        return;
+    };
+    if ms > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
+}
+
 // ============================================================================
 // Invalidation tests
 // ============================================================================
@@ -619,6 +631,7 @@ async fn llm_accuracy_invalidation() {
                     case.description, case.expected, e
                 );
                 _fail += 1;
+                delay_between_llm_cases().await;
                 continue;
             }
         };
@@ -639,6 +652,7 @@ async fn llm_accuracy_invalidation() {
             }
             _fail += 1;
         }
+        delay_between_llm_cases().await;
     }
 
     let accuracy = (pass as f64 / total as f64) * 100.0;
@@ -676,6 +690,7 @@ async fn llm_accuracy_contradiction() {
                     case.description, case.expected, e
                 );
                 _fail += 1;
+                delay_between_llm_cases().await;
                 continue;
             }
         };
@@ -696,6 +711,7 @@ async fn llm_accuracy_contradiction() {
             }
             _fail += 1;
         }
+        delay_between_llm_cases().await;
     }
 
     let accuracy = (pass as f64 / total as f64) * 100.0;
@@ -759,6 +775,7 @@ async fn llm_accuracy_topic_canonicalization() {
                 _fail += 1;
             }
         }
+        delay_between_llm_cases().await;
     }
 
     let accuracy = (pass as f64 / total as f64) * 100.0;
@@ -809,6 +826,7 @@ async fn llm_accuracy_full_report() {
             case.expected,
             actual
         );
+        delay_between_llm_cases().await;
     }
 
     // Contradiction
@@ -839,6 +857,7 @@ async fn llm_accuracy_full_report() {
             case.expected,
             actual
         );
+        delay_between_llm_cases().await;
     }
 
     // Topic canonicalization
@@ -871,6 +890,7 @@ async fn llm_accuracy_full_report() {
             case.expected_new,
             got
         );
+        delay_between_llm_cases().await;
     }
 
     let grand_total = total_pass + total_fail;
